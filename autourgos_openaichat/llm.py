@@ -148,8 +148,15 @@ class BaseLLM(ABC):
                         self.circuit_failure_threshold = 5
                         self.circuit_cooldown_time = 30.0
 
+            # Guard the check-then-create with a plain threading.Lock so two
+            # threads (each driving their own event loop) can't both observe
+            # `None` and each create a separate asyncio.Lock — a narrow but
+            # real check-then-set race. Simple double-checked locking: cheap
+            # fast path when already initialized, safe slow path otherwise.
             if self._async_circuit_lock is None:
-                self._async_circuit_lock = asyncio.Lock()
+                with _lazy_init_lock:
+                    if self._async_circuit_lock is None:
+                        self._async_circuit_lock = asyncio.Lock()
 
             async with self._async_circuit_lock:
                 if self._circuit_tripped_until is not None:

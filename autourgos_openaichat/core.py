@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger("autourgos_openaichat")
+logger = logging.getLogger(__name__)
 
 # ── Module loading ────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ def release_openai_client(client: Any) -> None:
         try:
             closer()
         except Exception:
-            pass
+            logger.warning("Failed to close OpenAI client cleanly", exc_info=True)
 
 
 async def release_async_openai_client(client: Any) -> None:
@@ -104,14 +104,14 @@ async def release_async_openai_client(client: Any) -> None:
         try:
             await acloser()
         except Exception:
-            pass
+            logger.warning("Failed to aclose() async OpenAI client cleanly", exc_info=True)
         return
     closer = getattr(client, "close", None)
     if callable(closer):
         try:
             closer()
         except Exception:
-            pass
+            logger.warning("Failed to close() async OpenAI client cleanly", exc_info=True)
 
 
 # ── Model name normalization ──────────────────────────────────────────────────

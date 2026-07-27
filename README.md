@@ -296,6 +296,8 @@ for name, cfg in PROVIDERS.items():
 
 ## Quick Start
 
+Set the `OPENAI_API_KEY` environment variable first, or pass `api_key=` directly.
+
 ```python
 from autourgos_openaichat import OpenAIChatModel
 
@@ -491,6 +493,8 @@ llm.invoke(prompt_variables={"language": "French"})
 Pass image files, URLs, or raw bytes alongside text.
 
 > Note: vision support depends on the provider and model. GPT-4o, LLaVA (Ollama), and several others support it.
+
+> **Warning:** the file-path branch reads whatever local path it is given and base64-embeds its contents into the outgoing API request, with no path validation. Do not pass LLM- or tool-controlled paths through unchecked — an unchecked path could be used to exfiltrate arbitrary local files.
 
 ### From a file path
 
