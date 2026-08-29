@@ -193,36 +193,69 @@ def build_multimodal_messages(
 
 # ── Response format builder ───────────────────────────────────────────────────
 
+def _enforce_additional_properties_false(schema: Any) -> Any:
+    """
+    Recursively set ``additionalProperties: False`` on every object node.
+
+    OpenAI/Azure's ``strict: true`` json_schema mode rejects any object node
+    that doesn't explicitly forbid extra properties. Pydantic's
+    ``model_json_schema()`` doesn't set this by default, so a plain Pydantic
+    model passed as ``output_schema`` fails with a 400 ("additionalProperties'
+    is required to be supplied and to be false") unless this is applied —
+    including inside ``$defs``, ``properties``, ``items``, and the
+    ``anyOf``/``allOf``/``oneOf`` branches Pydantic emits for nested/optional
+    models.
+    """
+    if isinstance(schema, dict):
+        if schema.get("type") == "object" or "properties" in schema:
+            schema.setdefault("additionalProperties", False)
+        for key in ("properties", "$defs", "definitions"):
+            sub = schema.get(key)
+            if isinstance(sub, dict):
+                for value in sub.values():
+                    _enforce_additional_properties_false(value)
+        for key in ("items", "additionalProperties"):
+            sub = schema.get(key)
+            if isinstance(sub, dict):
+                _enforce_additional_properties_false(sub)
+        for key in ("anyOf", "allOf", "oneOf"):
+            sub = schema.get(key)
+            if isinstance(sub, list):
+                for value in sub:
+                    _enforce_additional_properties_false(value)
+    return schema
+
+
 def build_response_format(
-    response_schema: Any = None,
+    output_schema: Any = None,
     response_mime_type: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Build the response_format parameter for Chat Completions.
 
     - ``response_mime_type="application/json"``  →  {"type": "json_object"}
-    - ``response_schema`` (Pydantic model)       →  {"type": "json_schema", ...}
+    - ``output_schema`` (Pydantic model)         →  {"type": "json_schema", ...}
     - Otherwise                                  →  None
     """
-    if response_schema is not None:
+    if output_schema is not None:
         # Pydantic v2 model class
-        schema_fn = getattr(response_schema, "model_json_schema", None)
+        schema_fn = getattr(output_schema, "model_json_schema", None)
         if callable(schema_fn):
             return {
                 "type": "json_schema",
                 "json_schema": {
-                    "name": getattr(response_schema, "__name__", "response"),
-                    "schema": schema_fn(),
+                    "name": getattr(output_schema, "__name__", "response"),
+                    "schema": _enforce_additional_properties_false(schema_fn()),
                     "strict": True,
                 },
             }
         # Plain dict schema
-        if isinstance(response_schema, dict):
+        if isinstance(output_schema, dict):
             return {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "schema": response_schema,
+                    "schema": _enforce_additional_properties_false(dict(output_schema)),
                     "strict": True,
                 },
             }

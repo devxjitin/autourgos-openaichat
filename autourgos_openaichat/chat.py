@@ -39,6 +39,10 @@ from .core import (
 configure_runtime_environment()
 _OPENAI_AVAILABLE, openai_cls, async_openai_cls, _OPENAI_IMPORT_ERROR = load_openai_module()
 
+# Client errors that will never succeed on retry — fail fast instead of
+# burning the retry budget and adding latency.
+_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
+
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
 
@@ -110,12 +114,12 @@ class OpenAIChatModel(BaseLLM):
         *,
         organization: Optional[str] = None,
         project: Optional[str] = None,
-        system_instruction: Optional[str] = None,
+        system_prompt: Optional[str] = None,
         prompt_template: Optional[str] = None,
         temperature: Optional[float] = None,
         top_p: Optional[float] = None,
         max_tokens: Optional[int] = None,
-        response_schema: Any = None,
+        output_schema: Any = None,
         response_mime_type: Optional[str] = None,
         structured_output: bool = False,
         streaming: bool = False,
@@ -134,13 +138,13 @@ class OpenAIChatModel(BaseLLM):
             base_url: Override the API base URL (e.g. for proxies or local servers).
             organization: OpenAI organization ID.
             project: OpenAI project ID.
-            system_instruction: System prompt prepended to every request.
+            system_prompt: System prompt prepended to every request.
             prompt_template: Optional template string with {variable} placeholders.
                 When set, invoke() accepts prompt_variables= instead of a direct prompt.
             temperature: Sampling temperature (0–2). Higher = more random.
             top_p: Nucleus sampling probability (0–1).
             max_tokens: Maximum tokens to generate.
-            response_schema: Pydantic model or dict for structured/JSON output.
+            output_schema: Pydantic model or dict for structured/JSON output.
             response_mime_type: e.g. "application/json" to enable json_object mode.
             structured_output: If True, invoke() returns a metadata dict instead of a string.
             streaming: If True, invoke()/ainvoke() internally stream and return the full text.
@@ -163,12 +167,12 @@ class OpenAIChatModel(BaseLLM):
         self.base_url = base_url
         self.organization = organization
         self.project = project
-        self.system_instruction = system_instruction
+        self.system_prompt = system_prompt
         self.prompt_template = prompt_template
         self.temperature = temperature
         self.top_p = top_p
         self.max_tokens = max_tokens
-        self.response_schema = response_schema
+        self.output_schema = output_schema
         self.response_mime_type = response_mime_type
         self.structured_output = structured_output
         self.streaming = streaming
@@ -279,8 +283,8 @@ class OpenAIChatModel(BaseLLM):
     ) -> List[Dict[str, Any]]:
         """Build the full messages list including optional system instruction."""
         messages: List[Dict[str, Any]] = []
-        if self.system_instruction:
-            messages.append({"role": "system", "content": self.system_instruction})
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
         if isinstance(prompt, list):
             messages.extend(prompt)
             if files:
@@ -291,7 +295,7 @@ class OpenAIChatModel(BaseLLM):
 
     def _build_base_params(self, *, messages: List[Dict[str, Any]], stream: bool) -> Dict[str, Any]:
         response_format = build_response_format(
-            response_schema=self.response_schema,
+            output_schema=self.output_schema,
             response_mime_type=self.response_mime_type,
         )
         return build_chat_completion_create_params(
@@ -313,6 +317,12 @@ class OpenAIChatModel(BaseLLM):
                 return self._client.chat.completions.create(**params)
             except Exception as exc:
                 last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                if status_code in _NON_RETRYABLE_STATUS_CODES:
+                    raise OpenAIChatModelAPIError(
+                        f"Chat Completions request failed with non-retryable status "
+                        f"{status_code}. Error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
                         f"Chat Completions request failed after {self.max_retries} attempts. "
@@ -328,6 +338,12 @@ class OpenAIChatModel(BaseLLM):
                 return await self._async_client.chat.completions.create(**params)
             except Exception as exc:
                 last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                if status_code in _NON_RETRYABLE_STATUS_CODES:
+                    raise OpenAIChatModelAPIError(
+                        f"Async Chat Completions request failed with non-retryable status "
+                        f"{status_code}. Error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
                         f"Async Chat Completions request failed after {self.max_retries} attempts. "
@@ -379,6 +395,12 @@ class OpenAIChatModel(BaseLLM):
                 raise
             except Exception as exc:
                 last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                if status_code in _NON_RETRYABLE_STATUS_CODES:
+                    raise OpenAIChatModelAPIError(
+                        f"Streaming failed with non-retryable status {status_code}. "
+                        f"Error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if emitted or attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
                         f"Streaming failed after {attempt} attempt(s). "
@@ -406,6 +428,12 @@ class OpenAIChatModel(BaseLLM):
                 raise
             except Exception as exc:
                 last_exc = exc
+                status_code = getattr(exc, "status_code", None)
+                if status_code in _NON_RETRYABLE_STATUS_CODES:
+                    raise OpenAIChatModelAPIError(
+                        f"Async streaming failed with non-retryable status {status_code}. "
+                        f"Error: {type(exc).__name__}: {exc}"
+                    ) from exc
                 if emitted or attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
                         f"Async streaming failed after {attempt} attempt(s). "
