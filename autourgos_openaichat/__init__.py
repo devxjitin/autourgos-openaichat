@@ -31,6 +31,7 @@ from .chat import (
     OpenAIChatModelError,
     OpenAIChatModelImportError,
     OpenAIChatModelResponseError,
+    OpenAIChatModelValidationError,
 )
 from .llm import BaseLLM, CircuitBreakerOpenException, FunctionCall, ToolCallResponse
 from .model_runtime import (
@@ -57,6 +58,7 @@ __all__ = [
     "OpenAIChatModelResponseError",
     "OpenAIChatModelConfigError",
     "OpenAIChatModelAllProvidersFailedError",
+    "OpenAIChatModelValidationError",
     # Base types
     "BaseLLM",
     "FunctionCall",

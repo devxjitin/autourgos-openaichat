@@ -793,3 +793,87 @@ def test_stream_no_fallback_after_partial_emit():
     with pytest.raises(OpenAIChatModelAPIError, match="mid-response"):
         list(llm.stream("hi"))
     llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
+
+
+# ── 19. Validated structured output (invoke_structured) ─────────────────────
+
+from autourgos_openaichat import OpenAIChatModelValidationError
+
+
+class CityInfo(BaseModel):
+    city: str
+    population: int
+
+
+def test_invoke_structured_requires_pydantic_schema():
+    llm = make_llm(output_schema={"type": "object"})
+    with pytest.raises(OpenAIChatModelConfigError):
+        llm.invoke_structured("Tokyo")
+
+
+def test_invoke_structured_requires_output_schema_at_all():
+    llm = make_llm()
+    with pytest.raises(OpenAIChatModelConfigError):
+        llm.invoke_structured("Tokyo")
+
+
+def test_invoke_structured_incompatible_with_streaming():
+    llm = make_llm(output_schema=CityInfo, streaming=True)
+    with pytest.raises(OpenAIChatModelConfigError):
+        llm.invoke_structured("Tokyo")
+
+
+def test_invoke_structured_success_first_try():
+    llm = make_llm(output_schema=CityInfo)
+    llm._client.chat.completions.create.return_value = make_completion(
+        json.dumps({"city": "Tokyo", "population": 13960000})
+    )
+    result = llm.invoke_structured("Tell me about Tokyo.")
+    assert isinstance(result, CityInfo)
+    assert result.city == "Tokyo"
+    assert result.population == 13960000
+    assert llm.last_metadata["validation_retries"] == 0
+    assert llm.last_metadata["provider_used"] == "primary"
+
+
+def test_invoke_structured_retries_on_validation_failure_then_succeeds():
+    llm = make_llm(output_schema=CityInfo)
+    llm._client.chat.completions.create.side_effect = [
+        make_completion(json.dumps({"city": "Tokyo"})),          # missing population -> invalid
+        make_completion(json.dumps({"city": "Tokyo", "population": 13960000})),
+    ]
+    result = llm.invoke_structured("Tell me about Tokyo.")
+    assert result.population == 13960000
+    assert llm.last_metadata["validation_retries"] == 1
+    assert llm._client.chat.completions.create.call_count == 2
+    # second call includes the correction messages fed back to the model
+    second_messages = llm._client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    assert second_messages[-2]["role"] == "assistant"
+    assert second_messages[-1]["role"] == "user"
+    assert "failed schema validation" in second_messages[-1]["content"]
+
+
+def test_invoke_structured_raises_after_retries_exhausted():
+    llm = make_llm(output_schema=CityInfo)
+    llm._client.chat.completions.create.return_value = make_completion(
+        json.dumps({"city": "Tokyo"})  # always missing population
+    )
+    with pytest.raises(OpenAIChatModelValidationError) as exc_info:
+        llm.invoke_structured("Tell me about Tokyo.", max_validation_retries=1)
+    assert llm._client.chat.completions.create.call_count == 2  # 1 initial + 1 retry
+    assert exc_info.value.raw_text == json.dumps({"city": "Tokyo"})
+    assert exc_info.value.validation_error is not None
+
+
+def test_ainvoke_structured_success():
+    llm = make_llm(output_schema=CityInfo)
+    llm._async_client.chat.completions.create.return_value = make_completion(
+        json.dumps({"city": "Paris", "population": 2148000})
+    )
+
+    async def run():
+        return await llm.ainvoke_structured("Tell me about Paris.")
+
+    result = asyncio.run(run())
+    assert isinstance(result, CityInfo)
+    assert result.city == "Paris"

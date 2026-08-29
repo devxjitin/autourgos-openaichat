@@ -31,6 +31,7 @@ print(reply)
 - Multi-turn conversations via a plain message list
 - Automatic retries with exponential back-off, plus a circuit breaker for cascading-failure protection
 - Automatic provider fallback chain: define backup providers and `invoke()` transparently switches to them if the primary fails, no proxy/gateway needed
+- Validated structured output: `invoke_structured()` returns a validated Pydantic instance directly, feeding validation errors back to the model and retrying on failure
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -65,6 +66,7 @@ print(reply)
   - [Prompt Templates](#prompt-templates)
   - [Vision Input](#vision-input)
   - [Structured Output](#structured-output)
+  - [Validated Structured Output](#validated-structured-output)
   - [JSON Mode](#json-mode)
   - [Native Tool Calling](#native-tool-calling)
   - [Multi-Turn Conversations](#multi-turn-conversations)
@@ -643,6 +645,51 @@ print(data)
 # {"city": "Tokyo", "country": "Japan", "population": 13960000}
 ```
 
+### Validated Structured Output
+
+`invoke_structured()` builds on `output_schema=` and closes the loop: instead of a raw JSON string you get back a **validated Pydantic instance directly**. If the response fails validation (a missing field, a failed `@field_validator`, a provider that ignores strict JSON-schema mode, ...), the validation error is fed back to the model as a correction message and the request is retried, up to `max_validation_retries` times.
+
+```python
+from pydantic import BaseModel, Field
+from autourgos_openaichat import OpenAIChatModel
+
+class CityInfo(BaseModel):
+    city: str = Field(description="Name of the city")
+    country: str = Field(description="Name of the country")
+    population: int = Field(description="Approximate population")
+
+llm = OpenAIChatModel(model="gpt-4o", output_schema=CityInfo)
+
+result = llm.invoke_structured("Tell me about Tokyo.")
+print(result)
+# CityInfo(city='Tokyo', country='Japan', population=13960000)
+print(result.population)
+# 13960000
+
+print(llm.last_metadata["validation_retries"])
+# 0  (no correction was needed)
+```
+
+If validation keeps failing, `OpenAIChatModelValidationError` (a subclass of `OpenAIChatModelResponseError`) is raised with `.raw_text` (the last invalid response) and `.validation_error` (the last Pydantic error):
+
+```python
+from autourgos_openaichat import OpenAIChatModelValidationError
+
+try:
+    result = llm.invoke_structured("Tell me about Tokyo.", max_validation_retries=1)
+except OpenAIChatModelValidationError as e:
+    print(f"Still invalid after retries: {e.validation_error}")
+    print(f"Last raw response: {e.raw_text}")
+```
+
+Async version: `await llm.ainvoke_structured(...)`.
+
+Notes:
+- `output_schema` must be a Pydantic `BaseModel` **class** (not a plain dict, not `None`) — a dict schema has no `.model_validate_json()` to validate against.
+- Incompatible with `streaming=True`, same as `structured_output=True`.
+- Each validation retry re-runs the full transport-level retry budget (`max_retries`) too, so worst-case cost/latency is roughly `max_validation_retries × max_retries` — keep `max_validation_retries` small (the default is `2`).
+- Composes with [Provider Fallback Chain](#provider-fallback-chain) — each attempt goes through the same primary → fallback sequence.
+
 ### JSON Mode
 
 Force the model to return valid JSON without a schema.
@@ -1055,6 +1102,8 @@ llm = OpenAIChatModel(
 | `abatch_invoke(prompts)` | `list[str]`, concurrent results |
 | `invoke_with_tools(prompt, tools)` | `ToolCallResponse`, `.tool_calls` list or `.text` |
 | `ainvoke_with_tools(prompt, tools)` | same as `invoke_with_tools`, async |
+| `invoke_structured(prompt)` | Validated instance of `output_schema` (raises `OpenAIChatModelValidationError` on exhaustion) |
+| `ainvoke_structured(prompt)` | same as `invoke_structured`, async |
 | `create(messages)` | Raw OpenAI `ChatCompletion` response object |
 | `acreate(messages)` | same as `create`, async |
 
@@ -1090,6 +1139,7 @@ llm = OpenAIChatModel(
 | `"total_cost"` | `float` | Total cost in USD (only if both pricing set) |
 | `"latency_ms"` | `float` | Request round-trip time in milliseconds |
 | `"provider_used"` | `str` | `"primary"` or `"fallback[N]:<model>"` — which provider actually served the request |
+| `"validation_retries"` | `int` | Only set after `invoke_structured()`/`ainvoke_structured()` — number of correction attempts needed (`0` = valid on first try) |
 
 ---
 

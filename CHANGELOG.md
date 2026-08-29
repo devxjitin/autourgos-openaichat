@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.2.0] - 2026-08-29
+
+- Added: `invoke_structured()` / `ainvoke_structured()` — a validated structured-output loop on top of `output_schema=`. Instead of a raw JSON string, returns a validated Pydantic instance directly; on validation failure, the error is fed back to the model as a correction message and the request is retried (`max_validation_retries=`, default `2`). Composes with the provider fallback chain (each attempt goes through the same primary → fallback sequence) and with the circuit breaker (registered in `BaseLLM.__init_subclass__` like `invoke`/`invoke_with_tools`).
+- Added: `OpenAIChatModelValidationError` (subclass of `OpenAIChatModelResponseError`), raised when validation retries are exhausted, carrying `.raw_text` and `.validation_error`.
+- Added: `"validation_retries"` key in `llm.last_metadata` after a successful `invoke_structured()`/`ainvoke_structured()` call.
+- Non-breaking: `invoke()`/`ainvoke()`/`structured_output=True` behavior and return types are completely unchanged — this is a new, separate pair of methods. Added 7 new tests (72 total).
+
 ## [2.1.0] - 2026-08-29
 
 - Added: automatic provider fallback chain via a new `fallback_providers=` constructor param — `invoke()`, `ainvoke()`, `stream()`, `astream()`, `invoke_with_tools()`, and `ainvoke_with_tools()` now transparently retry against ordered backup providers if the primary exhausts its retries, with no proxy/gateway service required. Each fallback entry resolves its own `api_key`/`base_url` independently (no credential inheritance from the primary). Streaming fallback only triggers before any chunk has been emitted, to avoid duplicating/corrupting partial output already sent to the caller.

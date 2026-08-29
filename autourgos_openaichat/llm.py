@@ -90,6 +90,10 @@ class BaseLLM(ABC):
             cls.invoke_with_tools = cls._wrap_sync(cls.invoke_with_tools)
         if "ainvoke_with_tools" in cls.__dict__:
             cls.ainvoke_with_tools = cls._wrap_async(cls.ainvoke_with_tools)
+        if "invoke_structured" in cls.__dict__:
+            cls.invoke_structured = cls._wrap_sync(cls.invoke_structured)
+        if "ainvoke_structured" in cls.__dict__:
+            cls.ainvoke_structured = cls._wrap_async(cls.ainvoke_structured)
 
     # ── Circuit breaker wrappers ──────────────────────────────────────────────
 

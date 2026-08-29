@@ -66,6 +66,23 @@ class OpenAIChatModelConfigError(OpenAIChatModelError):
     """Raised for incompatible configuration options."""
 
 
+class OpenAIChatModelValidationError(OpenAIChatModelResponseError):
+    """
+    Raised by ``invoke_structured()``/``ainvoke_structured()`` when the model's
+    output still fails Pydantic validation against ``output_schema`` after all
+    validation retries are exhausted.
+
+    ``.raw_text`` holds the last raw (invalid) response text.
+    ``.validation_error`` holds the last Pydantic ``ValidationError`` (or JSON
+    decode error) that caused the failure.
+    """
+
+    def __init__(self, message: str, *, raw_text: Optional[str], validation_error: Exception) -> None:
+        super().__init__(message)
+        self.raw_text = raw_text
+        self.validation_error = validation_error
+
+
 class OpenAIChatModelAllProvidersFailedError(OpenAIChatModelAPIError):
     """
     Raised when the primary provider and every configured fallback provider
@@ -701,6 +718,140 @@ class OpenAIChatModel(BaseLLM):
         self.last_metadata = metadata
         return metadata if self.structured_output else response_text
 
+    # ── Validated structured output ──────────────────────────────────────────
+    # Server-side json_schema strict mode (build_response_format) already
+    # constrains the shape of the JSON. This adds a feedback loop on top: if
+    # the result still fails Pydantic validation (e.g. a custom @field_validator,
+    # or a provider that ignores strict mode), the error is sent back to the
+    # model and it gets another chance to correct itself.
+
+    @staticmethod
+    def _is_pydantic_model_class(obj: Any) -> bool:
+        return isinstance(obj, type) and hasattr(obj, "model_validate_json")
+
+    def _require_structured_schema(self) -> None:
+        if not self._is_pydantic_model_class(self.output_schema):
+            raise OpenAIChatModelConfigError(
+                "invoke_structured()/ainvoke_structured() require output_schema= to be a "
+                "Pydantic BaseModel class (not a plain dict or None)."
+            )
+        if self.streaming:
+            raise OpenAIChatModelConfigError(
+                "invoke_structured()/ainvoke_structured() are incompatible with streaming=True."
+            )
+
+    @staticmethod
+    def _correction_messages(bad_text: str, error: Exception) -> List[Dict[str, Any]]:
+        return [
+            {"role": "assistant", "content": bad_text},
+            {
+                "role": "user",
+                "content": (
+                    "Your last response failed schema validation with this error:\n"
+                    f"{error}\n\nReturn corrected JSON that matches the schema exactly."
+                ),
+            },
+        ]
+
+    def invoke_structured(
+        self,
+        prompt: Any = None,
+        prompt_variables: Optional[Dict[str, Any]] = None,
+        *,
+        files: Optional[Any] = None,
+        image_detail: Optional[str] = None,
+        max_validation_retries: int = 2,
+    ) -> Any:
+        """
+        Generate a response and validate it against ``output_schema`` (a Pydantic
+        BaseModel class), retrying with the validation error fed back to the model
+        on failure.
+
+        Returns:
+            A validated instance of ``output_schema``.
+
+        Raises:
+            OpenAIChatModelValidationError: if the response still fails validation
+                after ``max_validation_retries`` correction attempts.
+        """
+        self._require_structured_schema()
+        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        messages = self._build_messages(resolved, files=files, image_detail=image_detail)
+
+        last_error: Optional[Exception] = None
+        last_text: Optional[str] = None
+        for attempt in range(max_validation_retries + 1):
+            with track_latency() as timing:
+                response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
+            last_text = response_text
+            try:
+                validated = self.output_schema.model_validate_json(response_text)
+            except Exception as exc:
+                last_error = exc
+                messages = messages + self._correction_messages(response_text, exc)
+                continue
+            self.last_metadata = build_structured_output(
+                model_name=self._model_name,
+                response_text=response_text,
+                raw_response=raw_response,
+                latency_ms=timing["latency_ms"],
+                input_pricing=self.input_pricing,
+                output_pricing=self.output_pricing,
+                extra_fields={"provider_used": provider_label, "validation_retries": attempt},
+            )
+            return validated
+
+        raise OpenAIChatModelValidationError(
+            f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
+            f"Last error: {last_error}",
+            raw_text=last_text,
+            validation_error=last_error,
+        )
+
+    async def ainvoke_structured(
+        self,
+        prompt: Any = None,
+        prompt_variables: Optional[Dict[str, Any]] = None,
+        *,
+        files: Optional[Any] = None,
+        image_detail: Optional[str] = None,
+        max_validation_retries: int = 2,
+    ) -> Any:
+        """Async version of invoke_structured()."""
+        self._require_structured_schema()
+        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        messages = self._build_messages(resolved, files=files, image_detail=image_detail)
+
+        last_error: Optional[Exception] = None
+        last_text: Optional[str] = None
+        for attempt in range(max_validation_retries + 1):
+            with track_latency() as timing:
+                response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
+            last_text = response_text
+            try:
+                validated = self.output_schema.model_validate_json(response_text)
+            except Exception as exc:
+                last_error = exc
+                messages = messages + self._correction_messages(response_text, exc)
+                continue
+            self.last_metadata = build_structured_output(
+                model_name=self._model_name,
+                response_text=response_text,
+                raw_response=raw_response,
+                latency_ms=timing["latency_ms"],
+                input_pricing=self.input_pricing,
+                output_pricing=self.output_pricing,
+                extra_fields={"provider_used": provider_label, "validation_retries": attempt},
+            )
+            return validated
+
+        raise OpenAIChatModelValidationError(
+            f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
+            f"Last error: {last_error}",
+            raw_text=last_text,
+            validation_error=last_error,
+        )
+
     def stream(
         self,
         prompt: Any = None,
@@ -871,4 +1022,5 @@ __all__ = [
     "OpenAIChatModelResponseError",
     "OpenAIChatModelConfigError",
     "OpenAIChatModelAllProvidersFailedError",
+    "OpenAIChatModelValidationError",
 ]
