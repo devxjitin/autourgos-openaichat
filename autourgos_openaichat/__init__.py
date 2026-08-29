@@ -30,6 +30,7 @@ from .chat import (
     OpenAIChatModelConfigError,
     OpenAIChatModelError,
     OpenAIChatModelImportError,
+    OpenAIChatModelRedactionBlockedError,
     OpenAIChatModelResponseError,
     OpenAIChatModelValidationError,
 )
@@ -65,6 +66,7 @@ __all__ = [
     "OpenAIChatModelConfigError",
     "OpenAIChatModelAllProvidersFailedError",
     "OpenAIChatModelValidationError",
+    "OpenAIChatModelRedactionBlockedError",
     # Base types
     "BaseLLM",
     "FunctionCall",

@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.5.0] - 2026-08-29
+
+- Added: PII/secret redaction — `redact_pii=True` scans the resolved prompt (string or messages list) for likely secrets/PII before it's sent, via a new `redaction.py` module. Built-in categories: `email`, `credit_card`, `ssn`, `phone`, `api_key` (OpenAI/GitHub/AWS/Google/Slack/JWT prefixes). `redact_categories=` restricts to a subset, `redact_custom_patterns=` adds extra `{name: regex}` entries. `redact_mode="mask"` (default) replaces matches with `[REDACTED:<category>]` and proceeds; `redact_mode="block"` raises the new `OpenAIChatModelRedactionBlockedError` (`.categories_found`) instead. Implemented as a single hook inside `_resolve_prompt()`, so it covers all 8 call paths uniformly (invoke/ainvoke/stream/astream/invoke_with_tools/ainvoke_with_tools/invoke_structured/ainvoke_structured). `llm.last_redacted_categories` exposes what matched the most recent call.
+- Explicitly documented as a heuristic, best-effort scrubber (regex-based) — not a compliance-grade DLP solution; false positives and false negatives are expected. Disabled by default. Only the resolved prompt is scanned — `system_prompt` and vision `files=` content are not touched.
+- Ledger integration: the [Call Ledger](#call-ledger-audit-trail) now records the already-redacted prompt (never the raw text) and a new `redacted_categories` column.
+- Non-breaking: `redact_pii=False` (the default) means `_resolve_prompt()`'s behavior is unchanged on every existing code path. 9 new tests (91 total).
+
 ## [2.4.0] - 2026-08-29
 
 - Added: budget governor — `max_session_cost=` (USD) on `OpenAIChatModel`, backed by a new generic `max_session_cost`/`session_cost_used`/`reset_session_budget()` in `BaseLLM` itself (so any future wrapper subclassing `BaseLLM` gets this for free). Once accumulated session cost reaches the cap, `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` raise `BudgetExceededException` **before** making the API call. Requires `input_pricing`/`output_pricing` to be set (raises `OpenAIChatModelConfigError` at construction otherwise). `reset_session_budget()` unblocks a tripped cap. A budget stop does not count toward the circuit breaker's failure threshold.

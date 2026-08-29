@@ -14,7 +14,7 @@ import logging
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS calls (
     output_cost REAL,
     total_cost REAL,
     latency_ms REAL,
-    validation_retries INTEGER
+    validation_retries INTEGER,
+    redacted_categories TEXT
 )
 """
 
@@ -42,7 +43,7 @@ _COLUMNS = (
     "created_at", "model", "provider_used", "call_type", "prompt", "response",
     "input_tokens", "output_tokens", "total_tokens",
     "input_cost", "output_cost", "total_cost",
-    "latency_ms", "validation_retries",
+    "latency_ms", "validation_retries", "redacted_categories",
 )
 
 _INSERT_SQL = (
@@ -69,6 +70,7 @@ def write_ledger_entry(
     prompt: Optional[str],
     response: Optional[str],
     metadata: Dict[str, Any],
+    redacted_categories: Optional[List[str]] = None,
 ) -> None:
     """
     Best-effort insert of one call record. Never raises — a ledger write
@@ -90,6 +92,7 @@ def write_ledger_entry(
         metadata.get("total_cost"),
         metadata.get("latency_ms"),
         metadata.get("validation_retries"),
+        ",".join(redacted_categories) if redacted_categories else None,
     )
     try:
         with lock:

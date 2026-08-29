@@ -34,6 +34,7 @@ print(reply)
 - Validated structured output: `invoke_structured()` returns a validated Pydantic instance directly, feeding validation errors back to the model and retrying on failure
 - Optional local call ledger: every call recorded to a SQLite file for audit/cost tracking — no external service, `sqlite3` is stdlib
 - Budget governor: set a hard USD cap and further calls are blocked once accumulated session cost reaches it
+- Optional PII/secret redaction: heuristic pre-flight scrubber masks (or blocks) emails, API keys, credit cards, SSNs, and phone numbers before they leave the process
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -78,6 +79,7 @@ print(reply)
   - [Provider Fallback Chain](#provider-fallback-chain)
   - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
   - [Budget Governor](#budget-governor)
+  - [PII / Secret Redaction](#pii--secret-redaction)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -1055,6 +1057,54 @@ Notes:
 - `invoke_structured()`/`ainvoke_structured()` check the budget once before the first attempt; a failed-validation retry attempt inside that call still costs money but its cost isn't tracked into `session_cost_used` today (only the final successful attempt's cost is recorded).
 - `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** budget-protected in this version — same gap as the [Call Ledger](#call-ledger-audit-trail), since no usage/cost metadata is computed on those paths.
 
+### PII / Secret Redaction
+
+> **This is a heuristic, best-effort scrubber, not a compliance-grade DLP solution.** It's regex-based: it will miss PII that doesn't match a known pattern (false negatives — a name, a home address, an unusual key format), and it will occasionally mask legitimate content that happens to match a pattern (false positives — e.g. a user asking "what does a US SSN look like, `123-45-6789`?"). Use it as one layer of defense-in-depth, not a guarantee. Disabled by default.
+
+Set `redact_pii=True` to scan the resolved prompt (string or a pre-built messages list) for likely secrets/PII before it's sent to the provider — covers **every** call path (`invoke`, `ainvoke`, `stream`, `astream`, `invoke_with_tools`, `ainvoke_with_tools`, `invoke_structured`, `ainvoke_structured`), since they all resolve the prompt through the same code path. Built-in categories: `email`, `credit_card`, `ssn`, `phone`, `api_key` (OpenAI `sk-`, GitHub `ghp_`/`github_pat_`, AWS `AKIA`, Google `AIza`, Slack `xox*-`, JWTs).
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(model="gpt-4o", redact_pii=True)
+
+reply = llm.invoke("My email is bob@example.com and my key is sk-abc123...")
+# The model actually receives:
+# "My email is [REDACTED:email] and my key is [REDACTED:api_key]"
+
+print(llm.last_redacted_categories)
+# ["email", "api_key"]
+```
+
+Restrict to specific categories, or add your own patterns:
+
+```python
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    redact_pii=True,
+    redact_categories=["email", "api_key"],           # skip credit_card/ssn/phone
+    redact_custom_patterns={"internal_id": r"EMP-\d{5}"},
+)
+```
+
+Use `redact_mode="block"` to reject the call outright instead of masking and proceeding:
+
+```python
+from autourgos_openaichat import OpenAIChatModelRedactionBlockedError
+
+llm = OpenAIChatModel(model="gpt-4o", redact_pii=True, redact_mode="block")
+
+try:
+    llm.invoke("My email is bob@example.com")
+except OpenAIChatModelRedactionBlockedError as e:
+    print(f"Blocked, matched: {e.categories_found}")
+    # Blocked, matched: ['email']
+```
+
+Notes:
+- Only the **resolved prompt** (what you pass to `invoke()`, or the rendered `prompt_template`) is scanned — `system_prompt` (developer-authored) and vision `files=` content (covered by its own existing warning) are **not** touched.
+- If [Call Ledger](#call-ledger-audit-trail) is enabled, the ledger's `prompt` column reflects the already-*redacted* text (the raw text is never persisted), and a new `redacted_categories` column records which categories matched each call.
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -1090,12 +1140,16 @@ from autourgos_openaichat import (
     OpenAIChatModelImportError,
     CircuitBreakerOpenException,
     BudgetExceededException,
+    OpenAIChatModelRedactionBlockedError,
 )
 
 llm = OpenAIChatModel(model="gpt-4o")
 
 try:
     reply = llm.invoke("Hello!")
+except OpenAIChatModelRedactionBlockedError as e:
+    # redact_mode="block" and the prompt matched a redaction category
+    print(f"Blocked: {e.categories_found}")
 except BudgetExceededException as e:
     # max_session_cost has been reached — call was blocked before hitting the API
     print(f"Budget exceeded: {e}")
@@ -1169,6 +1223,10 @@ llm = OpenAIChatModel(
 | `ledger_path` | `str` | `None` | If set, path to a local SQLite file that records every logged call (see [Call Ledger](#call-ledger-audit-trail)) |
 | `ledger_store_content` | `bool` | `True` | If `False`, the ledger omits prompt/response text and logs only metadata |
 | `max_session_cost` | `float` | `None` | USD hard cap — blocks further calls once `session_cost_used` reaches it. Requires `input_pricing`/`output_pricing` |
+| `redact_pii` | `bool` | `False` | Scan the resolved prompt for likely secrets/PII before sending (see [PII / Secret Redaction](#pii--secret-redaction)) |
+| `redact_categories` | `list[str]` | `None` | Which built-in categories to scan (`email`/`credit_card`/`ssn`/`phone`/`api_key`); default = all |
+| `redact_mode` | `str` | `"mask"` | `"mask"` replaces matches and proceeds; `"block"` raises instead of sending |
+| `redact_custom_patterns` | `dict[str, str]` | `None` | Extra `{name: regex}` entries merged in alongside the built-ins |
 
 ---
 

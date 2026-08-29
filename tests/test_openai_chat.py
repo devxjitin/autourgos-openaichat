@@ -1014,3 +1014,82 @@ def test_budget_exceeded_does_not_trip_circuit_breaker():
 
     llm.reset_session_budget()
     assert llm.invoke("hi again") == "Paris"  # circuit breaker never tripped
+
+
+# ── 22. PII / secret redaction ───────────────────────────────────────────────
+
+from autourgos_openaichat import OpenAIChatModelRedactionBlockedError
+
+
+def test_redaction_disabled_by_default():
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("my email is bob@example.com")
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert sent[0]["content"] == "my email is bob@example.com"
+    assert llm.last_redacted_categories == []
+
+
+def test_redaction_mask_mode_replaces_email_and_api_key():
+    llm = make_llm(redact_pii=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("contact me at bob@example.com, my key is sk-abcdefghijklmnopqrst")
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    text = sent[0]["content"]
+    assert "bob@example.com" not in text
+    assert "sk-abcdefghijklmnopqrst" not in text
+    assert "[REDACTED:email]" in text
+    assert "[REDACTED:api_key]" in text
+    assert set(llm.last_redacted_categories) == {"email", "api_key"}
+
+
+def test_redaction_block_mode_raises_before_api_call():
+    llm = make_llm(redact_pii=True, redact_mode="block")
+    with pytest.raises(OpenAIChatModelRedactionBlockedError) as exc_info:
+        llm.invoke("my email is bob@example.com")
+    assert "email" in exc_info.value.categories_found
+    llm._client.chat.completions.create.assert_not_called()
+
+
+def test_redaction_categories_filter_limits_scanning():
+    llm = make_llm(redact_pii=True, redact_categories=["api_key"])
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("my email is bob@example.com")  # email not in the enabled category list
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert sent[0]["content"] == "my email is bob@example.com"
+
+
+def test_redaction_custom_pattern():
+    llm = make_llm(redact_pii=True, redact_custom_patterns={"internal_id": r"EMP-\d{5}"})
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("employee EMP-12345 requested access")
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "[REDACTED:internal_id]" in sent[0]["content"]
+
+
+def test_redaction_applies_to_multi_turn_message_list():
+    llm = make_llm(redact_pii=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    messages = [{"role": "user", "content": "email me at bob@example.com"}]
+    llm.invoke(messages)
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "[REDACTED:email]" in sent[0]["content"]
+
+
+def test_invalid_redact_mode_raises_config_error():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", redact_pii=True, redact_mode="bogus")
+
+
+def test_unknown_redact_category_raises_config_error():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", redact_pii=True, redact_categories=["not_a_real_category"])
+
+
+def test_ledger_records_redacted_categories(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path), redact_pii=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("my email is bob@example.com")
+    row = _read_ledger_rows(db_path)[0]
+    assert row["redacted_categories"] == "email"

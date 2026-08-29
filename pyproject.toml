@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-openaichat"
-version = "2.4.0"
+version = "2.5.0"
 description = "Autourgos LLM wrapper for the OpenAI Chat Completions API"
 readme = "README.md"
 license = { file = "LICENSE" }

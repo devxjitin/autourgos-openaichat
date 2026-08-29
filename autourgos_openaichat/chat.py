@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
 from .ledger import close_ledger, open_ledger, write_ledger_entry
 from .llm import BaseLLM, FunctionCall, ToolCallResponse
+from .redaction import compile_patterns, redact_value
 from .model_runtime import (
     build_structured_output,
     coerce_prompt_variable,
@@ -83,6 +84,18 @@ class OpenAIChatModelValidationError(OpenAIChatModelResponseError):
         super().__init__(message)
         self.raw_text = raw_text
         self.validation_error = validation_error
+
+
+class OpenAIChatModelRedactionBlockedError(OpenAIChatModelError):
+    """
+    Raised when ``redact_mode="block"`` and the resolved prompt matched one or
+    more redaction patterns. ``.categories_found`` lists which categories
+    (e.g. "email", "api_key") triggered the block.
+    """
+
+    def __init__(self, message: str, *, categories_found: List[str]) -> None:
+        super().__init__(message)
+        self.categories_found = categories_found
 
 
 class OpenAIChatModelAllProvidersFailedError(OpenAIChatModelAPIError):
@@ -167,6 +180,10 @@ class OpenAIChatModel(BaseLLM):
         ledger_path: Optional[str] = None,
         ledger_store_content: bool = True,
         max_session_cost: Optional[float] = None,
+        redact_pii: bool = False,
+        redact_categories: Optional[List[str]] = None,
+        redact_mode: str = "mask",
+        redact_custom_patterns: Optional[Dict[str, str]] = None,
     ) -> None:
         """
         Args:
@@ -211,6 +228,16 @@ class OpenAIChatModel(BaseLLM):
                 unblock. This is a backstop, not an exact per-call prediction — a call's
                 cost is only known after its response, so the cap is checked against
                 already-accumulated cost, not the upcoming call.
+            redact_pii: If True, the resolved prompt (string or messages list) is scanned
+                for likely secrets/PII before it is sent. A heuristic, best-effort scrubber
+                — not a compliance-grade DLP solution. Default False (no scanning).
+            redact_categories: Which built-in categories to scan for ("email", "credit_card",
+                "ssn", "phone", "api_key"). Defaults to all of them when redact_pii=True.
+            redact_mode: "mask" (default) replaces matches with "[REDACTED:<category>]" and
+                the call proceeds; "block" raises OpenAIChatModelRedactionBlockedError instead
+                of sending anything.
+            redact_custom_patterns: Extra {name: regex} entries merged in alongside the
+                built-in categories.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -260,6 +287,20 @@ class OpenAIChatModel(BaseLLM):
         self.ledger_store_content = ledger_store_content
         self._ledger_conn = open_ledger(ledger_path) if ledger_path else None
         self._ledger_lock = threading.Lock()
+
+        if redact_mode not in ("mask", "block"):
+            raise OpenAIChatModelConfigError(
+                f"redact_mode must be 'mask' or 'block', got {redact_mode!r}."
+            )
+        self.redact_pii = redact_pii
+        self.redact_mode = redact_mode
+        self.last_redacted_categories: List[str] = []
+        try:
+            self._redact_patterns = (
+                compile_patterns(redact_categories, redact_custom_patterns) if redact_pii else {}
+            )
+        except ValueError as exc:
+            raise OpenAIChatModelConfigError(str(exc)) from exc
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -391,11 +432,37 @@ class OpenAIChatModel(BaseLLM):
             prompt=prompt_text,
             response=response_text,
             metadata=metadata,
+            redacted_categories=self.last_redacted_categories,
         )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _resolve_prompt(
+        self,
+        prompt: Any,
+        prompt_variables: Optional[Dict[str, Any]],
+        files: Optional[Any] = None,
+    ) -> Any:
+        """Resolve prompt or render from template, then apply redaction if enabled."""
+        resolved = self._resolve_prompt_raw(prompt, prompt_variables, files)
+        return self._apply_redaction(resolved)
+
+    def _apply_redaction(self, resolved: Any) -> Any:
+        self.last_redacted_categories = []
+        if not self.redact_pii:
+            return resolved
+        redacted, found = redact_value(resolved, self._redact_patterns)
+        self.last_redacted_categories = found
+        if not found:
+            return resolved
+        if self.redact_mode == "block":
+            raise OpenAIChatModelRedactionBlockedError(
+                f"Prompt blocked: matched redaction categories {found}.",
+                categories_found=found,
+            )
+        return redacted
+
+    def _resolve_prompt_raw(
         self,
         prompt: Any,
         prompt_variables: Optional[Dict[str, Any]],
