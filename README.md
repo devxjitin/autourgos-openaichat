@@ -35,6 +35,7 @@ print(reply)
 - Optional local call ledger: every call recorded to a SQLite file for audit/cost tracking — no external service, `sqlite3` is stdlib
 - Budget governor: set a hard USD cap and further calls are blocked once accumulated session cost reaches it
 - Optional PII/secret redaction: heuristic pre-flight scrubber masks (or blocks) emails, API keys, credit cards, SSNs, and phone numbers before they leave the process
+- Shadow-mode dual dispatch: compare the primary against backup providers concurrently, for observation only — invoke() always returns the primary's answer
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -80,6 +81,7 @@ print(reply)
   - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
   - [Budget Governor](#budget-governor)
   - [PII / Secret Redaction](#pii--secret-redaction)
+  - [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -1105,6 +1107,55 @@ Notes:
 - Only the **resolved prompt** (what you pass to `invoke()`, or the rendered `prompt_template`) is scanned — `system_prompt` (developer-authored) and vision `files=` content (covered by its own existing warning) are **not** touched.
 - If [Call Ledger](#call-ledger-audit-trail) is enabled, the ledger's `prompt` column reflects the already-*redacted* text (the raw text is never persisted), and a new `redacted_categories` column records which categories matched each call.
 
+### Shadow-Mode Dual Dispatch
+
+Dispatch the same prompt to one or more "shadow" providers **concurrently** with the primary, purely for observation — `invoke()`/`ainvoke()` always return the **primary's** answer. Useful for catching regressions before switching a default model/provider, or for ongoing quality/cost comparison.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(
+    model="gpt-4o",                          # primary — this is what invoke() returns
+    shadow_providers=[
+        {"model": "gpt-4o-mini"},             # compare against a cheaper model
+        {
+            "model": "llama3-70b-8192",       # and a different provider entirely
+            "api_key": "gsk_...",
+            "base_url": "https://api.groq.com/openai/v1",
+        },
+    ],
+)
+
+reply = llm.invoke("What is the capital of France?")
+print(reply)
+# Paris   (always from the primary — gpt-4o)
+
+for shadow in llm.last_shadow_results:
+    print(shadow)
+# {'provider_used': 'shadow[0]:gpt-4o-mini', 'response': 'Paris', 'similarity': 1.0,
+#  'input_tokens': 8, 'output_tokens': 1, 'total_cost': None, 'latency_ms': 210.4, 'error': None}
+# {'provider_used': 'shadow[1]:llama3-70b-8192', 'response': 'The capital of France is Paris.',
+#  'similarity': 0.42, 'input_tokens': 8, 'output_tokens': 7, 'total_cost': None,
+#  'latency_ms': 340.1, 'error': None}
+```
+
+`similarity` is a 0.0-1.0 text-overlap ratio (stdlib `difflib`) against the primary's response — a rough signal, not semantic similarity. React to results live with `on_shadow_result=`:
+
+```python
+def alert_on_drift(shadow_result):
+    if shadow_result["similarity"] is not None and shadow_result["similarity"] < 0.5:
+        print(f"Drift detected from {shadow_result['provider_used']}!")
+
+llm = OpenAIChatModel(model="gpt-4o", shadow_providers=[...], on_shadow_result=alert_on_drift)
+```
+
+Notes:
+- **Adds latency**: primary and shadow providers run concurrently (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`), so total call time is roughly `max(primary_latency, slowest_shadow_latency)` — not the sum, but not zero overhead either. `invoke()` waits for every shadow provider to finish (or fail) before returning.
+- **Costs real money**: each shadow provider gets one live API call per invocation. This cost is tracked in each shadow result's `total_cost` but is **not** added to `session_cost_used` / counted against `max_session_cost`.
+- Each shadow provider gets a single attempt — no retries. A shadow failure never raises and never affects the primary's result; it just shows up with `error` set in `last_shadow_results`.
+- Only `invoke()`/`ainvoke()` dispatch shadows in this version — `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()` don't.
+- If [Call Ledger](#call-ledger-audit-trail) is enabled, every shadow result is also recorded in a separate `shadow_calls` table.
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -1227,6 +1278,8 @@ llm = OpenAIChatModel(
 | `redact_categories` | `list[str]` | `None` | Which built-in categories to scan (`email`/`credit_card`/`ssn`/`phone`/`api_key`); default = all |
 | `redact_mode` | `str` | `"mask"` | `"mask"` replaces matches and proceeds; `"block"` raises instead of sending |
 | `redact_custom_patterns` | `dict[str, str]` | `None` | Extra `{name: regex}` entries merged in alongside the built-ins |
+| `shadow_providers` | `list[dict]` | `None` | Backup providers dispatched concurrently for observation only (see [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)) |
+| `on_shadow_result` | `Callable[[dict], None]` | `None` | Callback invoked with each shadow result dict as it completes |
 
 ---
 

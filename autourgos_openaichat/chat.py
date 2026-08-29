@@ -10,17 +10,20 @@ import asyncio
 import json
 import threading
 import time
-from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
-from .ledger import close_ledger, open_ledger, write_ledger_entry
+from .ledger import close_ledger, open_ledger, write_ledger_entry, write_shadow_ledger_entry
 from .llm import BaseLLM, FunctionCall, ToolCallResponse
 from .redaction import compile_patterns, redact_value
+from .shadow import compute_similarity
 from .model_runtime import (
     build_structured_output,
     coerce_prompt_variable,
     configure_runtime_environment,
     extract_template_fields,
     extract_text_from_response,
+    extract_usage_metadata,
     track_latency,
 )
 from .core import (
@@ -184,6 +187,8 @@ class OpenAIChatModel(BaseLLM):
         redact_categories: Optional[List[str]] = None,
         redact_mode: str = "mask",
         redact_custom_patterns: Optional[Dict[str, str]] = None,
+        shadow_providers: Optional[List[Dict[str, Any]]] = None,
+        on_shadow_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
         """
         Args:
@@ -238,6 +243,16 @@ class OpenAIChatModel(BaseLLM):
                 of sending anything.
             redact_custom_patterns: Extra {name: regex} entries merged in alongside the
                 built-in categories.
+            shadow_providers: Providers to dispatch the same prompt to concurrently with the
+                primary, for comparison only — invoke()/ainvoke() always return the primary's
+                result. Same entry shape as fallback_providers. Each shadow provider gets a
+                single attempt (no retries). Results land in llm.last_shadow_results and,
+                if a ledger is configured, in the shadow_calls table. Adds latency roughly
+                equal to the slower of (primary, slowest shadow) rather than their sum, and
+                each shadow call costs real money that is NOT counted toward
+                max_session_cost. Only invoke()/ainvoke() dispatch shadows in this version.
+            on_shadow_result: Optional callback invoked with each shadow result dict as it
+                completes.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -301,6 +316,17 @@ class OpenAIChatModel(BaseLLM):
             )
         except ValueError as exc:
             raise OpenAIChatModelConfigError(str(exc)) from exc
+
+        for i, entry in enumerate(shadow_providers or []):
+            if not entry.get("model"):
+                raise OpenAIChatModelConfigError(
+                    f"shadow_providers[{i}] is missing required key 'model'."
+                )
+        self.shadow_providers: List[Dict[str, Any]] = list(shadow_providers or [])
+        self.on_shadow_result = on_shadow_result
+        self.last_shadow_results: List[Dict[str, Any]] = []
+        self._shadow_sync_clients: Dict[int, Any] = {}
+        self._shadow_async_clients: Dict[int, Any] = {}
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -382,6 +408,52 @@ class OpenAIChatModel(BaseLLM):
                 self._get_fallback_async_client(i),
             )
 
+    def _get_shadow_sync_client(self, index: int) -> Any:
+        """Lazily create and cache the sync client for shadow_providers[index]."""
+        if index not in self._shadow_sync_clients:
+            cfg = self.shadow_providers[index]
+            self._shadow_sync_clients[index] = configure_openai_client(
+                openai_cls,
+                api_key=resolve_api_key(cfg.get("api_key")),
+                base_url=resolve_base_url(cfg.get("base_url")),
+                organization=cfg.get("organization"),
+                project=cfg.get("project"),
+                timeout=self.timeout,
+            )
+        return self._shadow_sync_clients[index]
+
+    def _get_shadow_async_client(self, index: int) -> Any:
+        """Lazily create and cache the async client for shadow_providers[index]."""
+        if index not in self._shadow_async_clients:
+            cfg = self.shadow_providers[index]
+            self._shadow_async_clients[index] = configure_async_openai_client(
+                async_openai_cls,
+                api_key=resolve_api_key(cfg.get("api_key")),
+                base_url=resolve_base_url(cfg.get("base_url")),
+                organization=cfg.get("organization"),
+                project=cfg.get("project"),
+                timeout=self.timeout,
+            )
+        return self._shadow_async_clients[index]
+
+    def _shadow_targets(self) -> Iterator[tuple]:
+        """Yield (label, model_name, client) for each configured shadow provider."""
+        for i, cfg in enumerate(self.shadow_providers):
+            yield (
+                f"shadow[{i}]:{cfg['model']}",
+                normalize_model_name(cfg["model"]),
+                self._get_shadow_sync_client(i),
+            )
+
+    def _async_shadow_targets(self) -> Iterator[tuple]:
+        """Yield (label, model_name, client) for each configured shadow provider."""
+        for i, cfg in enumerate(self.shadow_providers):
+            yield (
+                f"shadow[{i}]:{cfg['model']}",
+                normalize_model_name(cfg["model"]),
+                self._get_shadow_async_client(i),
+            )
+
     # ── Context managers ──────────────────────────────────────────────────────
 
     def __enter__(self) -> "OpenAIChatModel":
@@ -394,6 +466,9 @@ class OpenAIChatModel(BaseLLM):
         for client in self._fallback_sync_clients.values():
             release_openai_client(client)
         self._fallback_sync_clients = {}
+        for client in self._shadow_sync_clients.values():
+            release_openai_client(client)
+        self._shadow_sync_clients = {}
         close_ledger(self._ledger_conn)
         self._ledger_conn = None
 
@@ -413,6 +488,12 @@ class OpenAIChatModel(BaseLLM):
         for client in self._fallback_sync_clients.values():
             release_openai_client(client)
         self._fallback_sync_clients = {}
+        for client in self._shadow_async_clients.values():
+            await release_async_openai_client(client)
+        self._shadow_async_clients = {}
+        for client in self._shadow_sync_clients.values():
+            release_openai_client(client)
+        self._shadow_sync_clients = {}
         close_ledger(self._ledger_conn)
         self._ledger_conn = None
 
@@ -434,6 +515,129 @@ class OpenAIChatModel(BaseLLM):
             metadata=metadata,
             redacted_categories=self.last_redacted_categories,
         )
+
+    # ── Shadow-mode dual dispatch ────────────────────────────────────────────
+    # Runs concurrently with (not after) the primary call. invoke()/ainvoke()
+    # always return the primary's result; shadow results are observation-only.
+
+    def _build_shadow_result(
+        self,
+        label: str,
+        response_text: Optional[str],
+        raw_response: Any,
+        primary_text: Optional[str],
+        latency_ms: float,
+        error: Optional[str],
+    ) -> Dict[str, Any]:
+        if error is not None:
+            return {
+                "provider_used": label, "response": None, "similarity": None,
+                "input_tokens": None, "output_tokens": None, "total_cost": None,
+                "latency_ms": latency_ms, "error": error,
+            }
+        usage = extract_usage_metadata(raw_response)
+        total_cost = None
+        if (
+            self.input_pricing is not None and self.output_pricing is not None
+            and usage["input_tokens"] is not None and usage["output_tokens"] is not None
+        ):
+            total_cost = (
+                (usage["input_tokens"] / 1_000_000) * self.input_pricing
+                + (usage["output_tokens"] / 1_000_000) * self.output_pricing
+            )
+        return {
+            "provider_used": label,
+            "response": response_text,
+            "similarity": compute_similarity(primary_text, response_text),
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+            "total_cost": total_cost,
+            "latency_ms": latency_ms,
+            "error": None,
+        }
+
+    def _log_shadow_to_ledger(self, result: Dict[str, Any]) -> None:
+        if self._ledger_conn is None:
+            return
+        write_shadow_ledger_entry(
+            self._ledger_conn,
+            self._ledger_lock,
+            provider_used=result["provider_used"],
+            response=result["response"] if self.ledger_store_content else None,
+            similarity=result["similarity"],
+            input_tokens=result["input_tokens"],
+            output_tokens=result["output_tokens"],
+            total_cost=result["total_cost"],
+            latency_ms=result["latency_ms"],
+            error=result["error"],
+        )
+
+    def _finalize_shadow_results(self, raw_results: List[tuple], primary_text: Optional[str]) -> None:
+        results = []
+        for label, text, raw, latency_ms, error in raw_results:
+            result = self._build_shadow_result(label, text, raw, primary_text, latency_ms, error)
+            results.append(result)
+            self._log_shadow_to_ledger(result)
+            if self.on_shadow_result is not None:
+                try:
+                    self.on_shadow_result(result)
+                except Exception:
+                    logger.warning("on_shadow_result callback raised", exc_info=True)
+        self.last_shadow_results = results
+
+    def _execute_shadow_attempt_sync(
+        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]]
+    ) -> tuple:
+        params = dict(self._build_base_params(messages=messages, stream=False))
+        params["model"] = model_name
+        start = time.perf_counter()
+        try:
+            raw = client.chat.completions.create(**params)
+            text = extract_text_from_response(raw)
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            return label, text, raw, latency_ms, None
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}"
+
+    async def _execute_shadow_attempt_async(
+        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]]
+    ) -> tuple:
+        params = dict(self._build_base_params(messages=messages, stream=False))
+        params["model"] = model_name
+        start = time.perf_counter()
+        try:
+            raw = await client.chat.completions.create(**params)
+            text = extract_text_from_response(raw)
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            return label, text, raw, latency_ms, None
+        except Exception as exc:
+            latency_ms = round((time.perf_counter() - start) * 1000, 2)
+            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}"
+
+    def _dispatch_shadow_sync(self, messages: List[Dict[str, Any]], primary_text: Optional[str]) -> None:
+        if not self.shadow_providers:
+            self.last_shadow_results = []
+            return
+        targets = list(self._shadow_targets())
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            futures = [
+                executor.submit(self._execute_shadow_attempt_sync, label, model_name, client, messages)
+                for label, model_name, client in targets
+            ]
+            raw_results = [f.result() for f in futures]
+        self._finalize_shadow_results(raw_results, primary_text)
+
+    async def _dispatch_shadow_async(self, messages: List[Dict[str, Any]], primary_text: Optional[str]) -> None:
+        if not self.shadow_providers:
+            self.last_shadow_results = []
+            return
+        targets = list(self._async_shadow_targets())
+        raw_results = list(await asyncio.gather(*[
+            self._execute_shadow_attempt_async(label, model_name, client, messages)
+            for label, model_name, client in targets
+        ]))
+        self._finalize_shadow_results(raw_results, primary_text)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -804,6 +1008,7 @@ class OpenAIChatModel(BaseLLM):
         self.last_metadata = metadata
         self._record_session_cost(metadata.get("total_cost"))
         self._log_to_ledger(call_type="invoke", prompt=resolved, metadata=metadata)
+        self._dispatch_shadow_sync(messages, response_text)
         return metadata if self.structured_output else response_text
 
     async def ainvoke(
@@ -840,6 +1045,7 @@ class OpenAIChatModel(BaseLLM):
         self.last_metadata = metadata
         self._record_session_cost(metadata.get("total_cost"))
         self._log_to_ledger(call_type="ainvoke", prompt=resolved, metadata=metadata)
+        await self._dispatch_shadow_async(messages, response_text)
         return metadata if self.structured_output else response_text
 
     # ── Validated structured output ──────────────────────────────────────────

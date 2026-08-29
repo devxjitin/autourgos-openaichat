@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS calls (
 )
 """
 
+_SHADOW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS shadow_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    provider_used TEXT,
+    response TEXT,
+    similarity REAL,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    total_cost REAL,
+    latency_ms REAL,
+    error TEXT
+)
+"""
+
 _COLUMNS = (
     "created_at", "model", "provider_used", "call_type", "prompt", "response",
     "input_tokens", "output_tokens", "total_tokens",
@@ -51,11 +66,22 @@ _INSERT_SQL = (
     f"VALUES ({', '.join('?' for _ in _COLUMNS)})"
 )
 
+_SHADOW_COLUMNS = (
+    "created_at", "provider_used", "response", "similarity",
+    "input_tokens", "output_tokens", "total_cost", "latency_ms", "error",
+)
+
+_SHADOW_INSERT_SQL = (
+    f"INSERT INTO shadow_calls ({', '.join(_SHADOW_COLUMNS)}) "
+    f"VALUES ({', '.join('?' for _ in _SHADOW_COLUMNS)})"
+)
+
 
 def open_ledger(path: str) -> sqlite3.Connection:
     """Open (creating if needed) the SQLite ledger file at ``path``."""
     conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute(_SCHEMA)
+    conn.execute(_SHADOW_SCHEMA)
     conn.commit()
     return conn
 
@@ -102,6 +128,39 @@ def write_ledger_entry(
         logger.warning("Failed to write call ledger entry", exc_info=True)
 
 
+def write_shadow_ledger_entry(
+    conn: sqlite3.Connection,
+    lock: threading.Lock,
+    *,
+    provider_used: str,
+    response: Optional[str],
+    similarity: Optional[float],
+    input_tokens: Optional[int],
+    output_tokens: Optional[int],
+    total_cost: Optional[float],
+    latency_ms: Optional[float],
+    error: Optional[str],
+) -> None:
+    """Best-effort insert of one shadow-dispatch result. Never raises."""
+    row = (
+        datetime.now(timezone.utc).isoformat(),
+        provider_used,
+        response,
+        similarity,
+        input_tokens,
+        output_tokens,
+        total_cost,
+        latency_ms,
+        error,
+    )
+    try:
+        with lock:
+            conn.execute(_SHADOW_INSERT_SQL, row)
+            conn.commit()
+    except Exception:
+        logger.warning("Failed to write shadow ledger entry", exc_info=True)
+
+
 def close_ledger(conn: Optional[sqlite3.Connection]) -> None:
     """Close the ledger connection, if any, swallowing close-time errors."""
     if conn is None:
@@ -116,5 +175,6 @@ __all__ = [
     "logger",
     "open_ledger",
     "write_ledger_entry",
+    "write_shadow_ledger_entry",
     "close_ledger",
 ]

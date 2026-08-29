@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.0] - 2026-08-29
+
+- Added: shadow-mode dual dispatch — `shadow_providers=` on `OpenAIChatModel` dispatches the same prompt concurrently to one or more backup providers for observation only; `invoke()`/`ainvoke()` always return the primary's result. Runs primary + shadows in parallel (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`) — total latency is roughly `max(primary, slowest shadow)`, not their sum, but not zero-overhead either (the call waits for all shadows to finish or fail). New `shadow.py` module provides `compute_similarity()` (stdlib `difflib`, no new dependency) for a rough 0.0-1.0 text-overlap score against the primary's response. `on_shadow_result=` callback fires per shadow result as it completes. `llm.last_shadow_results` exposes the full list after each call.
+- Each shadow provider gets a single attempt (no retries); a shadow failure never raises and never affects the primary result — it surfaces as `error` in the result dict. Ledger gets a new `shadow_calls` table when enabled.
+- Documented limitations: shadow-provider cost is tracked per-result but NOT counted toward `max_session_cost`; only `invoke()`/`ainvoke()` dispatch shadows (not `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()`).
+- Non-breaking: `shadow_providers` unset (the default) means zero new behavior on any existing code path. 8 new tests (99 total).
+
 ## [2.5.0] - 2026-08-29
 
 - Added: PII/secret redaction — `redact_pii=True` scans the resolved prompt (string or messages list) for likely secrets/PII before it's sent, via a new `redaction.py` module. Built-in categories: `email`, `credit_card`, `ssn`, `phone`, `api_key` (OpenAI/GitHub/AWS/Google/Slack/JWT prefixes). `redact_categories=` restricts to a subset, `redact_custom_patterns=` adds extra `{name: regex}` entries. `redact_mode="mask"` (default) replaces matches with `[REDACTED:<category>]` and proceeds; `redact_mode="block"` raises the new `OpenAIChatModelRedactionBlockedError` (`.categories_found`) instead. Implemented as a single hook inside `_resolve_prompt()`, so it covers all 8 call paths uniformly (invoke/ainvoke/stream/astream/invoke_with_tools/ainvoke_with_tools/invoke_structured/ainvoke_structured). `llm.last_redacted_categories` exposes what matched the most recent call.

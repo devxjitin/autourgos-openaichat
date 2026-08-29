@@ -1093,3 +1093,117 @@ def test_ledger_records_redacted_categories(tmp_path):
     llm.invoke("my email is bob@example.com")
     row = _read_ledger_rows(db_path)[0]
     assert row["redacted_categories"] == "email"
+
+
+# ── 23. Shadow-mode dual dispatch ────────────────────────────────────────────
+
+def make_llm_with_shadow(shadow_models=("backup-model",), **kwargs):
+    """Construct an OpenAIChatModel with a mocked primary and mocked shadow clients."""
+    llm = OpenAIChatModel(
+        model="gpt-4o",
+        api_key="sk-test",
+        shadow_providers=[{"model": m, "api_key": "sk-shadow"} for m in shadow_models],
+        **kwargs,
+    )
+    llm._client = MagicMock()
+    llm._async_client = MagicMock()
+    llm._async_client.chat.completions.create = AsyncMock()
+    for i in range(len(shadow_models)):
+        sh_sync = MagicMock()
+        sh_async = MagicMock()
+        sh_async.chat.completions.create = AsyncMock()
+        llm._shadow_sync_clients[i] = sh_sync
+        llm._shadow_async_clients[i] = sh_async
+    return llm
+
+
+def test_shadow_disabled_by_default():
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"
+    assert llm.last_shadow_results == []
+
+
+def test_shadow_dispatch_returns_primary_and_records_shadow():
+    llm = make_llm_with_shadow(input_pricing=1000, output_pricing=1000)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion("Paris")
+
+    result = llm.invoke("What is the capital of France?")
+    assert result == "Paris"  # always the primary's answer
+    assert len(llm.last_shadow_results) == 1
+    shadow = llm.last_shadow_results[0]
+    assert shadow["provider_used"] == "shadow[0]:backup-model"
+    assert shadow["response"] == "Paris"
+    assert shadow["similarity"] == 1.0
+    assert shadow["error"] is None
+    assert shadow["total_cost"] is not None
+    sent_model = llm._shadow_sync_clients[0].chat.completions.create.call_args.kwargs["model"]
+    assert sent_model == "backup-model"
+
+
+def test_shadow_low_similarity_for_different_text():
+    llm = make_llm_with_shadow()
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion(
+        "The capital of France is a large European city called Paris, founded long ago."
+    )
+    llm.invoke("hi")
+    assert llm.last_shadow_results[0]["similarity"] < 0.5
+
+
+def test_shadow_provider_failure_does_not_break_primary():
+    llm = make_llm_with_shadow()
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.side_effect = RuntimeError("shadow down")
+
+    result = llm.invoke("hi")
+    assert result == "Paris"
+    shadow = llm.last_shadow_results[0]
+    assert shadow["error"] is not None
+    assert shadow["response"] is None
+
+
+def test_shadow_on_result_callback_invoked():
+    seen = []
+    llm = make_llm_with_shadow(on_shadow_result=lambda r: seen.append(r))
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("hi")
+    assert len(seen) == 1
+    assert seen[0]["provider_used"] == "shadow[0]:backup-model"
+
+
+def test_shadow_recorded_in_ledger(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm_with_shadow(ledger_path=str(db_path))
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("hi")
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute("SELECT * FROM shadow_calls").fetchall()]
+    conn.close()
+    assert len(rows) == 1
+    assert rows[0]["provider_used"] == "shadow[0]:backup-model"
+    assert rows[0]["similarity"] == 1.0
+
+
+def test_ainvoke_shadow_dispatch():
+    llm = make_llm_with_shadow()
+    llm._async_client.chat.completions.create.return_value = make_completion("Berlin")
+    llm._shadow_async_clients[0].chat.completions.create.return_value = make_completion("Berlin")
+
+    async def run():
+        return await llm.ainvoke("Capital of Germany?")
+
+    result = asyncio.run(run())
+    assert result == "Berlin"
+    assert len(llm.last_shadow_results) == 1
+    assert llm.last_shadow_results[0]["similarity"] == 1.0
+
+
+def test_shadow_config_missing_model_raises():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", shadow_providers=[{"api_key": "x"}])
