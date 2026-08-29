@@ -32,6 +32,7 @@ print(reply)
 - Automatic retries with exponential back-off, plus a circuit breaker for cascading-failure protection
 - Automatic provider fallback chain: define backup providers and `invoke()` transparently switches to them if the primary fails, no proxy/gateway needed
 - Validated structured output: `invoke_structured()` returns a validated Pydantic instance directly, feeding validation errors back to the model and retrying on failure
+- Optional local call ledger: every call recorded to a SQLite file for audit/cost tracking — no external service, `sqlite3` is stdlib
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -74,6 +75,7 @@ print(reply)
   - [Context Manager](#context-manager)
   - [Circuit Breaker](#circuit-breaker)
   - [Provider Fallback Chain](#provider-fallback-chain)
+  - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -978,6 +980,49 @@ except OpenAIChatModelAllProvidersFailedError as e:
 
 `create()`/`acreate()` (low-level raw access) are unaffected by `fallback_providers` — they always call the primary client only, since their contract is "the raw response of the client you configured."
 
+### Call Ledger (Audit Trail)
+
+Set `ledger_path=` to record every `invoke()`, `ainvoke()`, `invoke_structured()`, and `ainvoke_structured()` call to a local SQLite file — model, provider used, prompt/response, tokens, cost, latency, validation retries. No external service, no extra dependency (`sqlite3` is part of the Python standard library). Disabled by default (`ledger_path=None`) — zero overhead unless you turn it on.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    input_pricing=2.50,
+    output_pricing=10.00,
+    ledger_path="calls.db",   # created if it doesn't exist
+)
+
+llm.invoke("What is the capital of France?")
+llm.invoke("What is the capital of Japan?")
+```
+
+Query it with any SQLite tool:
+
+```bash
+sqlite3 calls.db "SELECT created_at, model, provider_used, total_cost, latency_ms FROM calls ORDER BY id;"
+```
+
+```python
+import sqlite3
+conn = sqlite3.connect("calls.db")
+for row in conn.execute("SELECT prompt, response, total_tokens FROM calls"):
+    print(row)
+```
+
+Set `ledger_store_content=False` to log only tokens/cost/latency/provider metadata — no prompt/response text — if you don't want request content persisted to disk:
+
+```python
+llm = OpenAIChatModel(model="gpt-4o", ledger_path="calls.db", ledger_store_content=False)
+```
+
+Notes:
+- A ledger write happens synchronously on every logged call (one `INSERT` + `commit`) — fine for audit/dev/debugging, but adds I/O latency in a tight high-throughput loop. It's not meant for a hot production path.
+- A ledger write can never break your actual LLM call: any failure (disk full, permissions, a closed connection) is logged as a warning and swallowed.
+- `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** logged in this version — they don't compute usage/cost metadata today.
+- The ledger connection is closed automatically by the context manager (`with OpenAIChatModel(...) as llm:`).
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -1085,6 +1130,8 @@ llm = OpenAIChatModel(
 | `circuit_failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
 | `circuit_cooldown_time` | `float` | `30.0` | Seconds the circuit stays open before probing |
 | `fallback_providers` | `list[dict]` | `None` | Ordered backup providers, each `{"model", "api_key"?, "base_url"?, "organization"?, "project"?}`, tried after the primary exhausts its retries |
+| `ledger_path` | `str` | `None` | If set, path to a local SQLite file that records every logged call (see [Call Ledger](#call-ledger-audit-trail)) |
+| `ledger_store_content` | `bool` | `True` | If `False`, the ledger omits prompt/response text and logs only metadata |
 
 ---
 

@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from typing import Any, AsyncIterator, Dict, Iterator, List, Optional
 
+from .ledger import close_ledger, open_ledger, write_ledger_entry
 from .llm import BaseLLM, FunctionCall, ToolCallResponse
 from .model_runtime import (
     build_structured_output,
@@ -162,6 +164,8 @@ class OpenAIChatModel(BaseLLM):
         circuit_failure_threshold: int = 5,
         circuit_cooldown_time: float = 30.0,
         fallback_providers: Optional[List[Dict[str, Any]]] = None,
+        ledger_path: Optional[str] = None,
+        ledger_store_content: bool = True,
     ) -> None:
         """
         Args:
@@ -193,6 +197,11 @@ class OpenAIChatModel(BaseLLM):
                 Each entry resolves its own api_key/base_url independently (falling back to
                 OPENAI_API_KEY/OPENAI_BASE_URL env vars, same as the primary) — nothing is
                 inherited from the primary provider's credentials.
+            ledger_path: If set, every invoke()/ainvoke()/invoke_structured()/
+                ainvoke_structured() call is recorded to a local SQLite file at this path
+                (created if it doesn't exist). None (default) disables the ledger entirely.
+            ledger_store_content: If True (default), prompt and response text are stored in
+                the ledger. Set False to log only tokens/cost/latency/provider metadata.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -231,6 +240,11 @@ class OpenAIChatModel(BaseLLM):
         self.fallback_providers: List[Dict[str, Any]] = list(fallback_providers or [])
         self._fallback_sync_clients: Dict[int, Any] = {}
         self._fallback_async_clients: Dict[int, Any] = {}
+
+        self.ledger_path = ledger_path
+        self.ledger_store_content = ledger_store_content
+        self._ledger_conn = open_ledger(ledger_path) if ledger_path else None
+        self._ledger_lock = threading.Lock()
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -324,6 +338,8 @@ class OpenAIChatModel(BaseLLM):
         for client in self._fallback_sync_clients.values():
             release_openai_client(client)
         self._fallback_sync_clients = {}
+        close_ledger(self._ledger_conn)
+        self._ledger_conn = None
 
     async def __aenter__(self) -> "OpenAIChatModel":
         return self
@@ -341,6 +357,26 @@ class OpenAIChatModel(BaseLLM):
         for client in self._fallback_sync_clients.values():
             release_openai_client(client)
         self._fallback_sync_clients = {}
+        close_ledger(self._ledger_conn)
+        self._ledger_conn = None
+
+    # ── Call ledger ───────────────────────────────────────────────────────────
+
+    def _log_to_ledger(self, *, call_type: str, prompt: Any, metadata: Dict[str, Any]) -> None:
+        if self._ledger_conn is None:
+            return
+        prompt_text = str(prompt) if (self.ledger_store_content and prompt is not None) else None
+        response_text = metadata.get("response") if self.ledger_store_content else None
+        write_ledger_entry(
+            self._ledger_conn,
+            self._ledger_lock,
+            model=metadata.get("model"),
+            provider_used=metadata.get("provider_used"),
+            call_type=call_type,
+            prompt=prompt_text,
+            response=response_text,
+            metadata=metadata,
+        )
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -683,6 +719,7 @@ class OpenAIChatModel(BaseLLM):
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
+        self._log_to_ledger(call_type="invoke", prompt=resolved, metadata=metadata)
         return metadata if self.structured_output else response_text
 
     async def ainvoke(
@@ -716,6 +753,7 @@ class OpenAIChatModel(BaseLLM):
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
+        self._log_to_ledger(call_type="ainvoke", prompt=resolved, metadata=metadata)
         return metadata if self.structured_output else response_text
 
     # ── Validated structured output ──────────────────────────────────────────
@@ -799,6 +837,7 @@ class OpenAIChatModel(BaseLLM):
                 output_pricing=self.output_pricing,
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
+            self._log_to_ledger(call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata)
             return validated
 
         raise OpenAIChatModelValidationError(
@@ -843,6 +882,7 @@ class OpenAIChatModel(BaseLLM):
                 output_pricing=self.output_pricing,
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
+            self._log_to_ledger(call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata)
             return validated
 
         raise OpenAIChatModelValidationError(

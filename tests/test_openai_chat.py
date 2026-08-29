@@ -877,3 +877,83 @@ def test_ainvoke_structured_success():
     result = asyncio.run(run())
     assert isinstance(result, CityInfo)
     assert result.city == "Paris"
+
+
+# ── 20. Call ledger ──────────────────────────────────────────────────────────
+
+import sqlite3
+
+
+def _read_ledger_rows(db_path):
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    rows = [dict(r) for r in conn.execute("SELECT * FROM calls ORDER BY id").fetchall()]
+    conn.close()
+    return rows
+
+
+def test_ledger_disabled_by_default():
+    llm = make_llm()
+    assert llm._ledger_conn is None
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"  # no ledger, no crash
+
+
+def test_ledger_records_successful_invoke(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("What is the capital of France?")
+
+    rows = _read_ledger_rows(db_path)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["call_type"] == "invoke"
+    assert row["provider_used"] == "primary"
+    assert row["prompt"] == "What is the capital of France?"
+    assert row["response"] == "Paris"
+    assert row["input_tokens"] == 9
+    assert row["output_tokens"] == 10
+
+
+def test_ledger_store_content_false_omits_text(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path), ledger_store_content=False)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("What is the capital of France?")
+
+    row = _read_ledger_rows(db_path)[0]
+    assert row["prompt"] is None
+    assert row["response"] is None
+    assert row["input_tokens"] == 9
+
+
+def test_ledger_records_ainvoke_and_invoke_structured(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    llm._async_client.chat.completions.create.return_value = make_completion("Berlin")
+
+    async def run():
+        return await llm.ainvoke("Capital of Germany?")
+
+    asyncio.run(run())
+
+    llm2 = make_llm(ledger_path=str(db_path), output_schema=CityInfo)
+    llm2._client.chat.completions.create.return_value = make_completion(
+        json.dumps({"city": "Tokyo", "population": 13960000})
+    )
+    llm2.invoke_structured("Tell me about Tokyo.")
+
+    rows = _read_ledger_rows(db_path)
+    call_types = [r["call_type"] for r in rows]
+    assert call_types == ["ainvoke", "invoke_structured"]
+    assert rows[1]["validation_retries"] == 0
+
+
+def test_ledger_write_failure_does_not_break_invoke(tmp_path):
+    """A broken ledger connection must never break the actual LLM call."""
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    llm._ledger_conn.close()  # simulate a broken/unwritable ledger
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"

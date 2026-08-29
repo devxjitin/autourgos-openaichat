@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.3.0] - 2026-08-29
+
+- Added: optional local call ledger — `ledger_path=` records every `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` call to a local SQLite file (model, provider used, prompt/response, tokens, cost, latency, validation retries). No external service, no extra dependency (`sqlite3` is stdlib). Disabled by default (`ledger_path=None`) — zero overhead unless enabled. `ledger_store_content=False` logs only metadata, omitting prompt/response text. A ledger write failure is logged as a warning and never breaks the actual LLM call. `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are not logged in this version (no usage/cost metadata computed on those paths today).
+- Non-breaking: `ledger_path` unset (the default) means no new code runs on any existing code path. 5 new tests (77 total).
+
 ## [2.2.0] - 2026-08-29
 
 - Added: `invoke_structured()` / `ainvoke_structured()` — a validated structured-output loop on top of `output_schema=`. Instead of a raw JSON string, returns a validated Pydantic instance directly; on validation failure, the error is fed back to the model as a correction message and the request is retried (`max_validation_retries=`, default `2`). Composes with the provider fallback chain (each attempt goes through the same primary → fallback sequence) and with the circuit breaker (registered in `BaseLLM.__init_subclass__` like `invoke`/`invoke_with_tools`).
