@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.0.1] - 2026-08-29
+
+- Maintenance release: no functional or documentation changes. Version bump to keep in step with the `autourgos-responses` companion package release.
+
 ## [2.0.0] - 2026-08-29
 
 - Changed (breaking): relicensed from MIT to Apache License 2.0 — adds an explicit patent grant and patent-retaliation clause. `LICENSE`, `pyproject.toml` classifiers, and README updated accordingly.
