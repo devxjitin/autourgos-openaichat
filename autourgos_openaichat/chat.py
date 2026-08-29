@@ -190,6 +190,8 @@ class OpenAIChatModel(BaseLLM):
         redact_categories: Optional[List[str]] = None,
         redact_mode: str = "mask",
         redact_custom_patterns: Optional[Dict[str, str]] = None,
+        redact_custom_terms: Optional[Dict[str, List[str]]] = None,
+        redact_patterns_file: Optional[str] = None,
         redact_restore_in_response: bool = False,
         shadow_providers: Optional[List[Dict[str, Any]]] = None,
         on_shadow_result: Optional[Callable[[Dict[str, Any]], None]] = None,
@@ -247,6 +249,16 @@ class OpenAIChatModel(BaseLLM):
                 of sending anything.
             redact_custom_patterns: Extra {name: regex} entries merged in alongside the
                 built-in categories.
+            redact_custom_terms: Bring-your-own dictionary of exact/literal values to redact,
+                as {category: ["value one", "value two", ...]} — no regex needed. Useful for
+                fixed known-sensitive strings (codenames, asset IDs, unit designations) that
+                aren't a pattern, just a list. Each value is escaped and matched literally.
+            redact_patterns_file: Path to a JSON file with "patterns" ({name: regex}) and/or
+                "terms" ({name: [values]}) keys — lets a team maintain its redaction
+                dictionary as a separate, version-controlled file instead of in code. Merged
+                with redact_custom_patterns/redact_custom_terms (those take precedence on a
+                name collision). Pass redact_categories=[] to disable all built-in categories
+                and use only your own dictionary.
             redact_restore_in_response: If True (default False), the final text returned to
                 the caller (and used for invoke_structured()'s schema validation) has any
                 echoed placeholders swapped back for their original values — the model never
@@ -324,7 +336,10 @@ class OpenAIChatModel(BaseLLM):
         self._last_redaction_map: Dict[str, str] = {}
         try:
             self._redact_patterns = (
-                compile_patterns(redact_categories, redact_custom_patterns) if redact_pii else {}
+                compile_patterns(
+                    redact_categories, redact_custom_patterns, redact_custom_terms, redact_patterns_file
+                )
+                if redact_pii else {}
             )
         except ValueError as exc:
             raise OpenAIChatModelConfigError(str(exc)) from exc

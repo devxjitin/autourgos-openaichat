@@ -1312,3 +1312,107 @@ def test_invoke_structured_correction_message_uses_masked_text_not_restored():
     correction_text = second_messages[-2]["content"]
     assert "[REDACTED:email:1]" in correction_text
     assert "bob@example.com" not in correction_text
+
+
+# ── 25. Bring-your-own redaction dictionary ──────────────────────────────────
+
+import tempfile
+import os
+
+
+def test_redact_custom_terms_literal_match():
+    llm = make_llm(
+        redact_pii=True,
+        redact_categories=[],  # built-ins fully off
+        redact_custom_terms={"codenames": ["EAGLE STRIKE", "MIDNIGHT RAVEN"]},
+    )
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("Operation EAGLE STRIKE begins at dawn")
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "EAGLE STRIKE" not in sent[0]["content"]
+    assert "[REDACTED:codenames]" in sent[0]["content"]
+    assert "codenames" in llm.last_redacted_categories
+
+
+def test_redact_custom_terms_matches_literally_not_as_regex():
+    """A term containing regex-special characters must still match literally."""
+    llm = make_llm(
+        redact_pii=True,
+        redact_categories=[],
+        redact_custom_terms={"asset_id": ["ASSET(7).X"]},
+    )
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("Deploy ASSET(7).X immediately")
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "ASSET(7).X" not in sent[0]["content"]
+    assert "[REDACTED:asset_id]" in sent[0]["content"]
+
+
+def test_redact_only_custom_dictionary_builtins_disabled():
+    llm = make_llm(
+        redact_pii=True,
+        redact_categories=[],
+        redact_custom_patterns={"secret_project": r"PROJECT-\d+"},
+    )
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("my email is bob@example.com, see PROJECT-42")  # email NOT redacted, built-ins off
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "bob@example.com" in sent[0]["content"]
+    assert "PROJECT-42" not in sent[0]["content"]
+
+
+def test_redact_patterns_file_loads_patterns_and_terms():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dictionary.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "patterns": {"classification_marking": r"TOP SECRET"},
+                "terms": {"codenames": ["MIDNIGHT RAVEN"]},
+            }, fh)
+
+        llm = make_llm(redact_pii=True, redact_categories=[], redact_patterns_file=path)
+        llm._client.chat.completions.create.return_value = make_completion("ok")
+        llm.invoke("TOP SECRET: operation MIDNIGHT RAVEN is active")
+        sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+        assert "TOP SECRET" not in sent[0]["content"]
+        assert "MIDNIGHT RAVEN" not in sent[0]["content"]
+        assert set(llm.last_redacted_categories) == {"classification_marking", "codenames"}
+
+
+def test_redact_patterns_file_missing_raises_config_error():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(
+            model="gpt-4o", api_key="sk-test",
+            redact_pii=True, redact_patterns_file="/no/such/file.json",
+        )
+
+
+def test_redact_patterns_file_malformed_json_raises_config_error():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not valid json")
+        with pytest.raises(OpenAIChatModelConfigError):
+            OpenAIChatModel(
+                model="gpt-4o", api_key="sk-test",
+                redact_pii=True, redact_patterns_file=path,
+            )
+
+
+def test_redact_inline_custom_patterns_override_file_on_name_collision():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "dictionary.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"patterns": {"secret_project": r"PROJECT-\d+"}}, fh)
+
+        llm = make_llm(
+            redact_pii=True,
+            redact_categories=[],
+            redact_patterns_file=path,
+            redact_custom_patterns={"secret_project": r"OVERRIDE-\d+"},  # same name, inline wins
+        )
+        llm._client.chat.completions.create.return_value = make_completion("ok")
+        llm.invoke("see PROJECT-42 and OVERRIDE-99")
+        sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+        assert "PROJECT-42" in sent[0]["content"]       # file pattern was overridden, no longer matches
+        assert "OVERRIDE-99" not in sent[0]["content"]  # inline pattern wins

@@ -1089,6 +1089,53 @@ llm = OpenAIChatModel(
 )
 ```
 
+#### Bring your own redaction dictionary
+
+The 5 built-in categories are intentionally generic. For a domain with its own sensitive vocabulary — codenames, asset IDs, classification markings, unit designations — bring your own dictionary instead of writing regex for everything:
+
+```python
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    redact_pii=True,
+    redact_categories=[],   # turn off all 5 built-ins — use only your own dictionary
+    redact_custom_terms={
+        "codenames": ["EAGLE STRIKE", "MIDNIGHT RAVEN"],   # exact literal values, no regex needed
+        "units": ["3rd Battalion", "7th Brigade"],
+    },
+    redact_custom_patterns={
+        "classification_marking": r"(TOP SECRET|SECRET|CONFIDENTIAL)(//[A-Z/]+)?",
+    },
+    redact_mode="block",   # masking a classification banner doesn't protect what's under it
+)
+```
+
+`redact_custom_terms` values are matched **literally** (each one is regex-escaped for you) — use it for a fixed list of known-sensitive strings. `redact_custom_patterns` is for when you actually need a regex.
+
+For a team-maintained dictionary that shouldn't live in code, point `redact_patterns_file` at a JSON file instead:
+
+```json
+{
+  "patterns": {
+    "classification_marking": "(TOP SECRET|SECRET|CONFIDENTIAL)(//[A-Z/]+)?"
+  },
+  "terms": {
+    "codenames": ["EAGLE STRIKE", "MIDNIGHT RAVEN"],
+    "units": ["3rd Battalion", "7th Brigade"]
+  }
+}
+```
+
+```python
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    redact_pii=True,
+    redact_categories=[],
+    redact_patterns_file="agency_dictionary.json",
+)
+```
+
+The file is loaded once at construction time — update it and recreate the client to pick up changes. If both a file and inline `redact_custom_patterns`/`redact_custom_terms` are given, they're merged and the inline ones win on a name collision.
+
 Use `redact_mode="block"` to reject the call outright instead of masking and proceeding:
 
 ```python
@@ -1306,6 +1353,8 @@ llm = OpenAIChatModel(
 | `redact_categories` | `list[str]` | `None` | Which built-in categories to scan (`email`/`credit_card`/`ssn`/`phone`/`api_key`); default = all |
 | `redact_mode` | `str` | `"mask"` | `"mask"` replaces matches and proceeds; `"block"` raises instead of sending |
 | `redact_custom_patterns` | `dict[str, str]` | `None` | Extra `{name: regex}` entries merged in alongside the built-ins |
+| `redact_custom_terms` | `dict[str, list[str]]` | `None` | Exact literal values to redact, `{category: [values]}` — no regex needed |
+| `redact_patterns_file` | `str` | `None` | Path to a JSON file with `"patterns"`/`"terms"` keys — a team-maintained dictionary outside code |
 | `redact_restore_in_response` | `bool` | `False` | Swap echoed placeholders back for their original values in the returned text/ledger-excluded response. Requires `redact_pii=True` and `redact_mode="mask"` |
 | `shadow_providers` | `list[dict]` | `None` | Backup providers dispatched concurrently for observation only (see [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)) |
 | `on_shadow_result` | `Callable[[dict], None]` | `None` | Callback invoked with each shadow result dict as it completes |

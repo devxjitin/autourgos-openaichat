@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.8.0] - 2026-08-29
+
+- Added: "bring your own redaction dictionary" — two new ways to extend redaction beyond regex, alongside the existing `redact_custom_patterns=`. `redact_custom_terms=` takes `{category: [literal values]}` and redacts them as exact (regex-escaped) matches — no regex needed for fixed known-sensitive strings like codenames or asset IDs. `redact_patterns_file=` loads a JSON file (`{"patterns": {...}, "terms": {...}}`) at construction time, so a team can maintain its redaction dictionary as a separate, version-controlled file instead of in code; malformed/missing files raise `OpenAIChatModelConfigError`. All sources merge together (built-ins, file, `redact_custom_terms`, `redact_custom_patterns`, in that precedence order — later wins on a name collision). `redact_categories=[]` disables all 5 built-ins so only your own dictionary is active.
+- `redaction.py`: new `terms_to_patterns()` and `load_patterns_file()` helpers; `compile_patterns()` signature extended (additive, existing positional/keyword usage unaffected).
+- No new built-in categories were added — the 5 general-purpose ones (`email`, `credit_card`, `ssn`, `phone`, `api_key`) are unchanged; domain-specific vocabulary (classification markings, codenames, geolocation formats, etc.) is meant to be supplied via this extension mechanism rather than hardcoded into the library.
+- Non-breaking: no new params set means identical behavior to 2.7.0. 7 new tests (114 total).
+
 ## [2.7.0] - 2026-08-29
 
 - Added: `redact_restore_in_response=True` on `OpenAIChatModel` — when a redacted prompt's placeholder is echoed back by the model, the final text returned to the caller has it swapped back for the original value. The model itself still never sees the real secret; this only helps pass-through/reference cases (a computation that needs the secret's actual value still can't work, since the model never saw it). Requires `redact_pii=True` and `redact_mode="mask"` (config error otherwise). Works with `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` — `invoke_structured()` restores *before* validating against `output_schema`, which also fixes validation failures caused by strict-format fields rejecting a raw placeholder.
