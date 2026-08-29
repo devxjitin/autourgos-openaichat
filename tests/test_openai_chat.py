@@ -14,7 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from autourgos_openaichat import (
     OpenAIChatModel,
@@ -1207,3 +1207,108 @@ def test_ainvoke_shadow_dispatch():
 def test_shadow_config_missing_model_raises():
     with pytest.raises(OpenAIChatModelConfigError):
         OpenAIChatModel(model="gpt-4o", api_key="sk-test", shadow_providers=[{"api_key": "x"}])
+
+
+# ── 24. Redaction restore-in-response ────────────────────────────────────────
+
+def test_redact_restore_requires_redact_pii():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", redact_restore_in_response=True)
+
+
+def test_redact_restore_requires_mask_mode():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(
+            model="gpt-4o", api_key="sk-test",
+            redact_pii=True, redact_mode="block", redact_restore_in_response=True,
+        )
+
+
+def test_redact_restore_disabled_placeholder_stays_in_output():
+    """Without redact_restore_in_response, an echoed placeholder is returned as-is."""
+    llm = make_llm(redact_pii=True, redact_categories=["email"])
+    llm._client.chat.completions.create.return_value = make_completion(
+        "Sure, noted contact: [REDACTED:email]"
+    )
+    result = llm.invoke("contact bob@example.com please")
+    assert result == "Sure, noted contact: [REDACTED:email]"
+
+
+def test_redact_restore_swaps_placeholder_back_in_output():
+    llm = make_llm(redact_pii=True, redact_categories=["email"], redact_restore_in_response=True)
+    llm._client.chat.completions.create.return_value = make_completion(
+        "Sure, noted contact: [REDACTED:email:1]"
+    )
+    result = llm.invoke("contact bob@example.com please")
+    assert result == "Sure, noted contact: bob@example.com"
+
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert "bob@example.com" not in sent[0]["content"]  # the model itself never saw it
+    assert "[REDACTED:email:1]" in sent[0]["content"]
+
+
+def test_redact_restore_multiple_secrets_each_correct():
+    llm = make_llm(redact_pii=True, redact_categories=["email"], redact_restore_in_response=True)
+    llm._client.chat.completions.create.return_value = make_completion(
+        "Contacts: [REDACTED:email:1] and [REDACTED:email:2]"
+    )
+    result = llm.invoke("emails: alice@example.com and bob@example.com")
+    assert result == "Contacts: alice@example.com and bob@example.com"
+
+
+def test_redact_restore_ledger_stays_masked(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(
+        ledger_path=str(db_path), redact_pii=True, redact_categories=["email"],
+        redact_restore_in_response=True,
+    )
+    llm._client.chat.completions.create.return_value = make_completion(
+        "Contact: [REDACTED:email:1]"
+    )
+    result = llm.invoke("email bob@example.com")
+    assert result == "Contact: bob@example.com"
+
+    row = _read_ledger_rows(db_path)[0]
+    assert row["response"] == "Contact: [REDACTED:email:1]"
+    assert "bob@example.com" not in row["response"]
+
+
+def test_invoke_structured_restore_fixes_validation():
+    class ContactInfo(BaseModel):
+        email: str
+
+        @field_validator("email")
+        @classmethod
+        def must_look_like_email(cls, v: str) -> str:
+            if "@" not in v:
+                raise ValueError("not a valid email")
+            return v
+
+    llm = make_llm(
+        output_schema=ContactInfo, redact_pii=True, redact_categories=["email"],
+        redact_restore_in_response=True,
+    )
+    llm._client.chat.completions.create.return_value = make_completion(
+        json.dumps({"email": "[REDACTED:email:1]"})
+    )
+    result = llm.invoke_structured("extract contact from: reach me at bob@example.com")
+    assert result.email == "bob@example.com"
+    llm._client.chat.completions.create.assert_called_once()  # validated on the first attempt
+
+
+def test_invoke_structured_correction_message_uses_masked_text_not_restored():
+    """A failed-validation retry must feed the model back its own masked output,
+    never the restored secret — otherwise the secret leaks into the model's context."""
+    llm = make_llm(
+        output_schema=CityInfo, redact_pii=True, redact_categories=["email"],
+        redact_restore_in_response=True,
+    )
+    llm._client.chat.completions.create.side_effect = [
+        make_completion(json.dumps({"city": "[REDACTED:email:1]"})),  # missing population -> invalid
+        make_completion(json.dumps({"city": "Tokyo", "population": 13960000})),
+    ]
+    llm.invoke_structured("contact bob@example.com about Tokyo")
+    second_messages = llm._client.chat.completions.create.call_args_list[1].kwargs["messages"]
+    correction_text = second_messages[-2]["content"]
+    assert "[REDACTED:email:1]" in correction_text
+    assert "bob@example.com" not in correction_text

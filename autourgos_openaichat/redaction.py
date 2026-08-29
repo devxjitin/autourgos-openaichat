@@ -49,58 +49,96 @@ def compile_patterns(
     return compiled
 
 
+class _RedactionState:
+    """
+    Accumulates categories found (and, if tracking, an original-value mapping
+    with globally unique placeholders) across every text field of one prompt.
+    """
+
+    def __init__(self, track_mapping: bool) -> None:
+        self.track_mapping = track_mapping
+        self.mapping: Dict[str, str] = {}
+        self.found: List[str] = []
+        self._counter = 0
+
+    def redact(self, text: str, patterns: Dict[str, "re.Pattern"]) -> str:
+        for category, pattern in patterns.items():
+            def _sub(match: "re.Match", _category: str = category) -> str:
+                self.found.append(_category)
+                if self.track_mapping:
+                    self._counter += 1
+                    placeholder = f"[REDACTED:{_category}:{self._counter}]"
+                    self.mapping[placeholder] = match.group(0)
+                    return placeholder
+                return f"[REDACTED:{_category}]"
+
+            text = pattern.sub(_sub, text)
+        return text
+
+
 def redact_text(text: str, patterns: Dict[str, "re.Pattern"]) -> Tuple[str, List[str]]:
-    """Mask every match in ``text``. Returns (redacted_text, categories_found)."""
-    found: List[str] = []
-    for category, pattern in patterns.items():
-        def _sub(match: "re.Match", _category: str = category) -> str:
-            found.append(_category)
-            return f"[REDACTED:{_category}]"
-
-        text = pattern.sub(_sub, text)
-    return text, found
+    """Mask every match in ``text`` with non-unique placeholders. Returns (redacted_text, categories_found)."""
+    state = _RedactionState(track_mapping=False)
+    redacted = state.redact(text, patterns)
+    return redacted, state.found
 
 
-def _redact_content(content: Any, patterns: Dict[str, "re.Pattern"], found: List[str]) -> Any:
+def _redact_content(content: Any, patterns: Dict[str, "re.Pattern"], state: _RedactionState) -> Any:
     if isinstance(content, str):
-        redacted, hits = redact_text(content, patterns)
-        found.extend(hits)
-        return redacted
+        return state.redact(content, patterns)
     if isinstance(content, list):
         new_parts = []
         for part in content:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
-                redacted, hits = redact_text(part["text"], patterns)
-                found.extend(hits)
-                part = {**part, "text": redacted}
+                part = {**part, "text": state.redact(part["text"], patterns)}
             new_parts.append(part)
         return new_parts
     return content
 
 
-def redact_value(value: Any, patterns: Dict[str, "re.Pattern"]) -> Tuple[Any, List[str]]:
+def redact_value(
+    value: Any,
+    patterns: Dict[str, "re.Pattern"],
+    *,
+    track_mapping: bool = False,
+) -> Tuple[Any, List[str], Dict[str, str]]:
     """
     Redact a resolved prompt value, which is either a plain string or a
     pre-built messages list (``[{"role": ..., "content": ...}, ...]``).
-    Returns (redacted_value, categories_found — deduplicated, order-preserving).
+
+    If ``track_mapping`` is True, placeholders are made unique
+    (``[REDACTED:category:N]``) and ``mapping`` records each placeholder's
+    original matched text, so the caller can restore it later with
+    ``restore_text()``. If False (the default), placeholders stay
+    ``[REDACTED:category]`` and ``mapping`` is empty — unchanged from the
+    original mask-only behavior.
+
+    Returns (redacted_value, categories_found — deduplicated, order-preserving, mapping).
     """
-    found: List[str] = []
+    state = _RedactionState(track_mapping=track_mapping)
     if isinstance(value, str):
-        redacted, hits = redact_text(value, patterns)
-        found.extend(hits)
+        redacted = state.redact(value, patterns)
     elif isinstance(value, list):
         redacted = []
         for message in value:
             if isinstance(message, dict) and "content" in message:
-                new_content = _redact_content(message["content"], patterns, found)
-                message = {**message, "content": new_content}
+                message = {**message, "content": _redact_content(message["content"], patterns, state)}
             redacted.append(message)
     else:
         redacted = value
 
     seen = set()
-    unique_found = [c for c in found if not (c in seen or seen.add(c))]
-    return redacted, unique_found
+    unique_found = [c for c in state.found if not (c in seen or seen.add(c))]
+    return redacted, unique_found, state.mapping
+
+
+def restore_text(text: Optional[str], mapping: Dict[str, str]) -> Optional[str]:
+    """Replace each tracked placeholder in ``text`` with its original matched value."""
+    if text is None or not mapping:
+        return text
+    for placeholder, original in mapping.items():
+        text = text.replace(placeholder, original)
+    return text
 
 
 __all__ = [
@@ -108,4 +146,5 @@ __all__ = [
     "compile_patterns",
     "redact_text",
     "redact_value",
+    "restore_text",
 ]

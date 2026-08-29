@@ -1107,6 +1107,34 @@ Notes:
 - Only the **resolved prompt** (what you pass to `invoke()`, or the rendered `prompt_template`) is scanned — `system_prompt` (developer-authored) and vision `files=` content (covered by its own existing warning) are **not** touched.
 - If [Call Ledger](#call-ledger-audit-trail) is enabled, the ledger's `prompt` column reflects the already-*redacted* text (the raw text is never persisted), and a new `redacted_categories` column records which categories matched each call.
 
+#### Getting the real value back: `redact_restore_in_response`
+
+Masking alone means the model can only ever echo back `[REDACTED:email]` — never the real value. If your task doesn't need the model to *reason about* the secret, just not leak it, set `redact_restore_in_response=True`: the model still never sees the real value, but if it echoes the placeholder back, the final result you get has the original value swapped back in.
+
+```python
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    redact_pii=True,
+    redact_categories=["email"],
+    redact_restore_in_response=True,   # requires redact_pii=True and redact_mode="mask" (the default)
+)
+
+reply = llm.invoke("Summarize this ticket: user bob@example.com reported a login bug")
+print(reply)
+# "The user bob@example.com reported a login bug." — the real email is back
+
+# What the model actually received:
+# "Summarize this ticket: user [REDACTED:email:1] reported a login bug"
+```
+
+This only works when the task is a **pass-through/reference**, not a computation on the secret's actual value — the model never saw `bob@example.com`, so it can't do anything that requires knowing what it actually is (e.g. "what's the domain part of this email?" would just get the placeholder back, unresolved, since there's nothing to restore in a domain the model made up from a token it never saw).
+
+Notes:
+- Works with `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()`. `invoke_structured()` restores *before* validating against `output_schema` — useful when a schema field expects a realistic value (e.g. a custom email-format validator) that a raw placeholder would fail.
+- On a failed `invoke_structured()` validation retry, the correction message sent back to the model always uses the **still-masked** text, never the restored one — the real secret is never fed into the model's own conversation history, even indirectly.
+- The [Call Ledger](#call-ledger-audit-trail) always records the masked text, regardless of this setting — restoration only affects what's returned to your code, never what's persisted.
+- Placeholders become unique per occurrence (`[REDACTED:email:1]`, `[REDACTED:email:2]`, ...) only when this is enabled, so each one restores to the correct original value; with it off, placeholders stay `[REDACTED:email]` as shown above.
+
 ### Shadow-Mode Dual Dispatch
 
 Dispatch the same prompt to one or more "shadow" providers **concurrently** with the primary, purely for observation — `invoke()`/`ainvoke()` always return the **primary's** answer. Useful for catching regressions before switching a default model/provider, or for ongoing quality/cost comparison.
@@ -1278,6 +1306,7 @@ llm = OpenAIChatModel(
 | `redact_categories` | `list[str]` | `None` | Which built-in categories to scan (`email`/`credit_card`/`ssn`/`phone`/`api_key`); default = all |
 | `redact_mode` | `str` | `"mask"` | `"mask"` replaces matches and proceeds; `"block"` raises instead of sending |
 | `redact_custom_patterns` | `dict[str, str]` | `None` | Extra `{name: regex}` entries merged in alongside the built-ins |
+| `redact_restore_in_response` | `bool` | `False` | Swap echoed placeholders back for their original values in the returned text/ledger-excluded response. Requires `redact_pii=True` and `redact_mode="mask"` |
 | `shadow_providers` | `list[dict]` | `None` | Backup providers dispatched concurrently for observation only (see [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)) |
 | `on_shadow_result` | `Callable[[dict], None]` | `None` | Callback invoked with each shadow result dict as it completes |
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.7.0] - 2026-08-29
+
+- Added: `redact_restore_in_response=True` on `OpenAIChatModel` — when a redacted prompt's placeholder is echoed back by the model, the final text returned to the caller has it swapped back for the original value. The model itself still never sees the real secret; this only helps pass-through/reference cases (a computation that needs the secret's actual value still can't work, since the model never saw it). Requires `redact_pii=True` and `redact_mode="mask"` (config error otherwise). Works with `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` — `invoke_structured()` restores *before* validating against `output_schema`, which also fixes validation failures caused by strict-format fields rejecting a raw placeholder.
+- `redaction.py`: placeholders become unique per occurrence (`[REDACTED:category:N]`) only when `redact_restore_in_response=True`; with it off, placeholders are unchanged (`[REDACTED:category]`) — zero behavior change to the existing 2.5.0 mask-mode format. New `restore_text()` helper.
+- Privacy: the [Call Ledger](#call-ledger-audit-trail) always records the still-masked text regardless of this setting — restoration only affects the value returned to the caller, never what's persisted. On a failed `invoke_structured()` validation retry, the correction message fed back to the model always uses the masked text too, so the real secret is never leaked into the model's own conversation history even indirectly.
+- Non-breaking: `redact_restore_in_response=False` (the default) is zero behavior change from 2.6.0. 8 new tests (107 total).
+
 ## [2.6.0] - 2026-08-29
 
 - Added: shadow-mode dual dispatch — `shadow_providers=` on `OpenAIChatModel` dispatches the same prompt concurrently to one or more backup providers for observation only; `invoke()`/`ainvoke()` always return the primary's result. Runs primary + shadows in parallel (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`) — total latency is roughly `max(primary, slowest shadow)`, not their sum, but not zero-overhead either (the call waits for all shadows to finish or fail). New `shadow.py` module provides `compute_similarity()` (stdlib `difflib`, no new dependency) for a rough 0.0-1.0 text-overlap score against the primary's response. `on_shadow_result=` callback fires per shadow result as it completes. `llm.last_shadow_results` exposes the full list after each call.

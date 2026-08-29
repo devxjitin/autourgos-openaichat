@@ -15,7 +15,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
 from .ledger import close_ledger, open_ledger, write_ledger_entry, write_shadow_ledger_entry
 from .llm import BaseLLM, FunctionCall, ToolCallResponse
-from .redaction import compile_patterns, redact_value
+from .redaction import compile_patterns, redact_value, restore_text
 from .shadow import compute_similarity
 from .model_runtime import (
     build_structured_output,
@@ -48,6 +48,9 @@ _OPENAI_AVAILABLE, openai_cls, async_openai_cls, _OPENAI_IMPORT_ERROR = load_ope
 # Client errors that will never succeed on retry — fail fast instead of
 # burning the retry budget and adding latency.
 _NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
+
+# Sentinel distinguishing "no override passed" from "override explicitly None".
+_UNSET = object()
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
@@ -187,6 +190,7 @@ class OpenAIChatModel(BaseLLM):
         redact_categories: Optional[List[str]] = None,
         redact_mode: str = "mask",
         redact_custom_patterns: Optional[Dict[str, str]] = None,
+        redact_restore_in_response: bool = False,
         shadow_providers: Optional[List[Dict[str, Any]]] = None,
         on_shadow_result: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
@@ -243,6 +247,13 @@ class OpenAIChatModel(BaseLLM):
                 of sending anything.
             redact_custom_patterns: Extra {name: regex} entries merged in alongside the
                 built-in categories.
+            redact_restore_in_response: If True (default False), the final text returned to
+                the caller (and used for invoke_structured()'s schema validation) has any
+                echoed placeholders swapped back for their original values — the model never
+                saw the real secret, but the caller still gets it back if the model merely
+                echoed/referenced it rather than needing to reason about its actual value.
+                The ledger always records the still-masked text regardless of this setting.
+                Requires redact_pii=True and redact_mode="mask".
             shadow_providers: Providers to dispatch the same prompt to concurrently with the
                 primary, for comparison only — invoke()/ainvoke() always return the primary's
                 result. Same entry shape as fallback_providers. Each shadow provider gets a
@@ -310,12 +321,26 @@ class OpenAIChatModel(BaseLLM):
         self.redact_pii = redact_pii
         self.redact_mode = redact_mode
         self.last_redacted_categories: List[str] = []
+        self._last_redaction_map: Dict[str, str] = {}
         try:
             self._redact_patterns = (
                 compile_patterns(redact_categories, redact_custom_patterns) if redact_pii else {}
             )
         except ValueError as exc:
             raise OpenAIChatModelConfigError(str(exc)) from exc
+
+        if redact_restore_in_response:
+            if not redact_pii:
+                raise OpenAIChatModelConfigError(
+                    "redact_restore_in_response requires redact_pii=True."
+                )
+            if redact_mode != "mask":
+                raise OpenAIChatModelConfigError(
+                    "redact_restore_in_response requires redact_mode='mask' — with "
+                    "redact_mode='block' the call never reaches the model, so there is "
+                    "nothing to restore."
+                )
+        self.redact_restore_in_response = redact_restore_in_response
 
         for i, entry in enumerate(shadow_providers or []):
             if not entry.get("model"):
@@ -499,11 +524,19 @@ class OpenAIChatModel(BaseLLM):
 
     # ── Call ledger ───────────────────────────────────────────────────────────
 
-    def _log_to_ledger(self, *, call_type: str, prompt: Any, metadata: Dict[str, Any]) -> None:
+    def _log_to_ledger(
+        self,
+        *,
+        call_type: str,
+        prompt: Any,
+        metadata: Dict[str, Any],
+        response_override: Any = _UNSET,
+    ) -> None:
         if self._ledger_conn is None:
             return
         prompt_text = str(prompt) if (self.ledger_store_content and prompt is not None) else None
-        response_text = metadata.get("response") if self.ledger_store_content else None
+        raw_response = metadata.get("response") if response_override is _UNSET else response_override
+        response_text = raw_response if self.ledger_store_content else None
         write_ledger_entry(
             self._ledger_conn,
             self._ledger_lock,
@@ -653,10 +686,14 @@ class OpenAIChatModel(BaseLLM):
 
     def _apply_redaction(self, resolved: Any) -> Any:
         self.last_redacted_categories = []
+        self._last_redaction_map = {}
         if not self.redact_pii:
             return resolved
-        redacted, found = redact_value(resolved, self._redact_patterns)
+        redacted, found, mapping = redact_value(
+            resolved, self._redact_patterns, track_mapping=self.redact_restore_in_response
+        )
         self.last_redacted_categories = found
+        self._last_redaction_map = mapping
         if not found:
             return resolved
         if self.redact_mode == "block":
@@ -996,6 +1033,10 @@ class OpenAIChatModel(BaseLLM):
         with track_latency() as timing:
             response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
 
+        masked_response_text = response_text
+        if self.redact_restore_in_response:
+            response_text = restore_text(response_text, self._last_redaction_map)
+
         metadata = build_structured_output(
             model_name=self._model_name,
             response_text=response_text,
@@ -1007,7 +1048,9 @@ class OpenAIChatModel(BaseLLM):
         )
         self.last_metadata = metadata
         self._record_session_cost(metadata.get("total_cost"))
-        self._log_to_ledger(call_type="invoke", prompt=resolved, metadata=metadata)
+        self._log_to_ledger(
+            call_type="invoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
+        )
         self._dispatch_shadow_sync(messages, response_text)
         return metadata if self.structured_output else response_text
 
@@ -1033,6 +1076,10 @@ class OpenAIChatModel(BaseLLM):
         with track_latency() as timing:
             response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
 
+        masked_response_text = response_text
+        if self.redact_restore_in_response:
+            response_text = restore_text(response_text, self._last_redaction_map)
+
         metadata = build_structured_output(
             model_name=self._model_name,
             response_text=response_text,
@@ -1044,7 +1091,9 @@ class OpenAIChatModel(BaseLLM):
         )
         self.last_metadata = metadata
         self._record_session_cost(metadata.get("total_cost"))
-        self._log_to_ledger(call_type="ainvoke", prompt=resolved, metadata=metadata)
+        self._log_to_ledger(
+            call_type="ainvoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
+        )
         await self._dispatch_shadow_async(messages, response_text)
         return metadata if self.structured_output else response_text
 
@@ -1114,16 +1163,22 @@ class OpenAIChatModel(BaseLLM):
         for attempt in range(max_validation_retries + 1):
             with track_latency() as timing:
                 response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
-            last_text = response_text
+            masked_response_text = response_text
+            text_to_validate = response_text
+            if self.redact_restore_in_response:
+                text_to_validate = restore_text(response_text, self._last_redaction_map)
+            last_text = text_to_validate
             try:
-                validated = self.output_schema.model_validate_json(response_text)
+                validated = self.output_schema.model_validate_json(text_to_validate)
             except Exception as exc:
                 last_error = exc
-                messages = messages + self._correction_messages(response_text, exc)
+                # Feed back the model's own (still-masked) output — never the restored
+                # text, which would leak the real secret into the model's own context.
+                messages = messages + self._correction_messages(masked_response_text, exc)
                 continue
             self.last_metadata = build_structured_output(
                 model_name=self._model_name,
-                response_text=response_text,
+                response_text=text_to_validate,
                 raw_response=raw_response,
                 latency_ms=timing["latency_ms"],
                 input_pricing=self.input_pricing,
@@ -1131,7 +1186,10 @@ class OpenAIChatModel(BaseLLM):
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
             self._record_session_cost(self.last_metadata.get("total_cost"))
-            self._log_to_ledger(call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata)
+            self._log_to_ledger(
+                call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata,
+                response_override=masked_response_text,
+            )
             return validated
 
         raise OpenAIChatModelValidationError(
@@ -1161,16 +1219,22 @@ class OpenAIChatModel(BaseLLM):
         for attempt in range(max_validation_retries + 1):
             with track_latency() as timing:
                 response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
-            last_text = response_text
+            masked_response_text = response_text
+            text_to_validate = response_text
+            if self.redact_restore_in_response:
+                text_to_validate = restore_text(response_text, self._last_redaction_map)
+            last_text = text_to_validate
             try:
-                validated = self.output_schema.model_validate_json(response_text)
+                validated = self.output_schema.model_validate_json(text_to_validate)
             except Exception as exc:
                 last_error = exc
-                messages = messages + self._correction_messages(response_text, exc)
+                # Feed back the model's own (still-masked) output — never the restored
+                # text, which would leak the real secret into the model's own context.
+                messages = messages + self._correction_messages(masked_response_text, exc)
                 continue
             self.last_metadata = build_structured_output(
                 model_name=self._model_name,
-                response_text=response_text,
+                response_text=text_to_validate,
                 raw_response=raw_response,
                 latency_ms=timing["latency_ms"],
                 input_pricing=self.input_pricing,
@@ -1178,7 +1242,10 @@ class OpenAIChatModel(BaseLLM):
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
             self._record_session_cost(self.last_metadata.get("total_cost"))
-            self._log_to_ledger(call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata)
+            self._log_to_ledger(
+                call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata,
+                response_override=masked_response_text,
+            )
             return validated
 
         raise OpenAIChatModelValidationError(
