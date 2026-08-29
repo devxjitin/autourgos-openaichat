@@ -21,6 +21,10 @@ class CircuitBreakerOpenException(Exception):
     """Raised when the circuit breaker is open, blocking LLM calls."""
 
 
+class BudgetExceededException(Exception):
+    """Raised when a call is blocked because max_session_cost has already been reached."""
+
+
 @dataclass
 class FunctionCall:
     """A single tool call requested by the LLM."""
@@ -68,6 +72,7 @@ class BaseLLM(ABC):
         output_pricing: Optional[float] = None,
         circuit_failure_threshold: int = 5,
         circuit_cooldown_time: float = 30.0,
+        max_session_cost: Optional[float] = None,
     ) -> None:
         self.input_pricing = input_pricing
         self.output_pricing = output_pricing
@@ -79,6 +84,30 @@ class BaseLLM(ABC):
         self._async_circuit_lock: Optional[asyncio.Lock] = None
         self.circuit_failure_threshold = circuit_failure_threshold
         self.circuit_cooldown_time = circuit_cooldown_time
+
+        self.max_session_cost = max_session_cost
+        self.session_cost_used: float = 0.0
+        self._budget_lock = threading.Lock()
+
+    # ── Budget governor ───────────────────────────────────────────────────────
+
+    def _check_budget(self) -> None:
+        if self.max_session_cost is not None and self.session_cost_used >= self.max_session_cost:
+            raise BudgetExceededException(
+                f"Session budget exceeded for {type(self).__name__}: "
+                f"${self.session_cost_used:.6f} used of ${self.max_session_cost:.6f} cap."
+            )
+
+    def _record_session_cost(self, cost: Optional[float]) -> None:
+        if cost is None:
+            return
+        with self._budget_lock:
+            self.session_cost_used += cost
+
+    def reset_session_budget(self) -> None:
+        """Reset accumulated session cost back to 0, unblocking a tripped budget cap."""
+        with self._budget_lock:
+            self.session_cost_used = 0.0
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -128,7 +157,7 @@ class BaseLLM(ABC):
             except Exception as exc:
                 if not isinstance(exc, (
                     TypeError, ValueError, KeyError, AttributeError,
-                    NotImplementedError, CircuitBreakerOpenException,
+                    NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
                 )):
                     with self._circuit_lock:
                         self._consecutive_failures += 1
@@ -180,7 +209,7 @@ class BaseLLM(ABC):
             except Exception as exc:
                 if not isinstance(exc, (
                     TypeError, ValueError, KeyError, AttributeError,
-                    NotImplementedError, CircuitBreakerOpenException,
+                    NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
                 )):
                     async with self._async_circuit_lock:
                         self._consecutive_failures += 1
@@ -232,4 +261,5 @@ __all__ = [
     "FunctionCall",
     "ToolCallResponse",
     "CircuitBreakerOpenException",
+    "BudgetExceededException",
 ]

@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.4.0] - 2026-08-29
+
+- Added: budget governor — `max_session_cost=` (USD) on `OpenAIChatModel`, backed by a new generic `max_session_cost`/`session_cost_used`/`reset_session_budget()` in `BaseLLM` itself (so any future wrapper subclassing `BaseLLM` gets this for free). Once accumulated session cost reaches the cap, `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` raise `BudgetExceededException` **before** making the API call. Requires `input_pricing`/`output_pricing` to be set (raises `OpenAIChatModelConfigError` at construction otherwise). `reset_session_budget()` unblocks a tripped cap. A budget stop does not count toward the circuit breaker's failure threshold.
+- Known limitation (documented in README): the cap is checked against cost already accumulated from prior calls, not an exact prediction of the upcoming call's cost. `invoke_structured()`'s failed-validation retry attempts aren't individually tracked into `session_cost_used`. `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are not budget-protected (no usage/cost metadata computed on those paths today, same gap as the call ledger).
+- Non-breaking: `max_session_cost` unset (the default) means zero new behavior on any existing code path. 5 new tests (82 total).
+
 ## [2.3.0] - 2026-08-29
 
 - Added: optional local call ledger — `ledger_path=` records every `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` call to a local SQLite file (model, provider used, prompt/response, tokens, cost, latency, validation retries). No external service, no extra dependency (`sqlite3` is stdlib). Disabled by default (`ledger_path=None`) — zero overhead unless enabled. `ledger_store_content=False` logs only metadata, omitting prompt/response text. A ledger write failure is logged as a warning and never breaks the actual LLM call. `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are not logged in this version (no usage/cost metadata computed on those paths today).

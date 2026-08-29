@@ -33,6 +33,7 @@ print(reply)
 - Automatic provider fallback chain: define backup providers and `invoke()` transparently switches to them if the primary fails, no proxy/gateway needed
 - Validated structured output: `invoke_structured()` returns a validated Pydantic instance directly, feeding validation errors back to the model and retrying on failure
 - Optional local call ledger: every call recorded to a SQLite file for audit/cost tracking — no external service, `sqlite3` is stdlib
+- Budget governor: set a hard USD cap and further calls are blocked once accumulated session cost reaches it
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -76,6 +77,7 @@ print(reply)
   - [Circuit Breaker](#circuit-breaker)
   - [Provider Fallback Chain](#provider-fallback-chain)
   - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
+  - [Budget Governor](#budget-governor)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -1023,6 +1025,36 @@ Notes:
 - `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** logged in this version — they don't compute usage/cost metadata today.
 - The ledger connection is closed automatically by the context manager (`with OpenAIChatModel(...) as llm:`).
 
+### Budget Governor
+
+Set `max_session_cost=` (USD) to hard-stop `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` once accumulated session cost reaches the cap — the blocked call is rejected **before** it reaches the API, so no further spend happens. Requires both `input_pricing` and `output_pricing` (cost can't be computed, and the cap can't trigger, without them).
+
+```python
+from autourgos_openaichat import OpenAIChatModel, BudgetExceededException
+
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    input_pricing=2.50,
+    output_pricing=10.00,
+    max_session_cost=0.50,   # hard stop at $0.50 for this client's lifetime
+)
+
+try:
+    for prompt in many_prompts:
+        reply = llm.invoke(prompt)
+except BudgetExceededException as e:
+    print(f"Stopped: {e}")
+    print(f"Used ${llm.session_cost_used:.4f} of ${llm.max_session_cost:.4f}")
+```
+
+Call `llm.reset_session_budget()` to zero out `session_cost_used` and unblock a tripped cap (e.g. starting a new billing period without recreating the client).
+
+Notes:
+- **This is a backstop, not an exact per-call prediction.** A call's cost is only known after its response comes back, so the cap is checked against cost *already accumulated from prior calls* — the call that pushes you over the cap still completes; only the *next* one is blocked.
+- Hitting the cap does **not** count toward the circuit breaker's failure threshold — a budget stop is not a provider failure.
+- `invoke_structured()`/`ainvoke_structured()` check the budget once before the first attempt; a failed-validation retry attempt inside that call still costs money but its cost isn't tracked into `session_cost_used` today (only the final successful attempt's cost is recorded).
+- `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** budget-protected in this version — same gap as the [Call Ledger](#call-ledger-audit-trail), since no usage/cost metadata is computed on those paths.
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -1057,12 +1089,16 @@ from autourgos_openaichat import (
     OpenAIChatModelConfigError,
     OpenAIChatModelImportError,
     CircuitBreakerOpenException,
+    BudgetExceededException,
 )
 
 llm = OpenAIChatModel(model="gpt-4o")
 
 try:
     reply = llm.invoke("Hello!")
+except BudgetExceededException as e:
+    # max_session_cost has been reached — call was blocked before hitting the API
+    print(f"Budget exceeded: {e}")
 except OpenAIChatModelAllProvidersFailedError as e:
     # Primary AND every configured fallback provider failed
     print(f"All providers failed: {e.attempts}")
@@ -1132,6 +1168,7 @@ llm = OpenAIChatModel(
 | `fallback_providers` | `list[dict]` | `None` | Ordered backup providers, each `{"model", "api_key"?, "base_url"?, "organization"?, "project"?}`, tried after the primary exhausts its retries |
 | `ledger_path` | `str` | `None` | If set, path to a local SQLite file that records every logged call (see [Call Ledger](#call-ledger-audit-trail)) |
 | `ledger_store_content` | `bool` | `True` | If `False`, the ledger omits prompt/response text and logs only metadata |
+| `max_session_cost` | `float` | `None` | USD hard cap — blocks further calls once `session_cost_used` reaches it. Requires `input_pricing`/`output_pricing` |
 
 ---
 

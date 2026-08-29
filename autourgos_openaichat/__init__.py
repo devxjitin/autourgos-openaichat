@@ -33,7 +33,13 @@ from .chat import (
     OpenAIChatModelResponseError,
     OpenAIChatModelValidationError,
 )
-from .llm import BaseLLM, CircuitBreakerOpenException, FunctionCall, ToolCallResponse
+from .llm import (
+    BaseLLM,
+    BudgetExceededException,
+    CircuitBreakerOpenException,
+    FunctionCall,
+    ToolCallResponse,
+)
 from .model_runtime import (
     build_structured_output,
     configure_runtime_environment,
@@ -64,6 +70,7 @@ __all__ = [
     "FunctionCall",
     "ToolCallResponse",
     "CircuitBreakerOpenException",
+    "BudgetExceededException",
     # Runtime helpers
     "track_latency",
     "extract_usage_metadata",

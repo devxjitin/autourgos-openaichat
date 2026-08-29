@@ -166,6 +166,7 @@ class OpenAIChatModel(BaseLLM):
         fallback_providers: Optional[List[Dict[str, Any]]] = None,
         ledger_path: Optional[str] = None,
         ledger_store_content: bool = True,
+        max_session_cost: Optional[float] = None,
     ) -> None:
         """
         Args:
@@ -202,13 +203,27 @@ class OpenAIChatModel(BaseLLM):
                 (created if it doesn't exist). None (default) disables the ledger entirely.
             ledger_store_content: If True (default), prompt and response text are stored in
                 the ledger. Set False to log only tokens/cost/latency/provider metadata.
+            max_session_cost: If set, blocks further invoke()/ainvoke()/invoke_structured()/
+                ainvoke_structured() calls once accumulated cost (llm.session_cost_used)
+                reaches this cap, raising BudgetExceededException. Requires both
+                input_pricing and output_pricing to be set (otherwise cost is never
+                computed and the cap would never trigger). Call reset_session_budget() to
+                unblock. This is a backstop, not an exact per-call prediction — a call's
+                cost is only known after its response, so the cap is checked against
+                already-accumulated cost, not the upcoming call.
         """
         super().__init__(
             input_pricing=input_pricing,
             output_pricing=output_pricing,
             circuit_failure_threshold=circuit_failure_threshold,
             circuit_cooldown_time=circuit_cooldown_time,
+            max_session_cost=max_session_cost,
         )
+        if max_session_cost is not None and (input_pricing is None or output_pricing is None):
+            raise OpenAIChatModelConfigError(
+                "max_session_cost requires both input_pricing and output_pricing to be set "
+                "— otherwise cost is never computed and the budget cap would never trigger."
+            )
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
@@ -700,6 +715,7 @@ class OpenAIChatModel(BaseLLM):
         Returns:
             Generated text string, or a metadata dict if structured_output=True.
         """
+        self._check_budget()
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
@@ -719,6 +735,7 @@ class OpenAIChatModel(BaseLLM):
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
+        self._record_session_cost(metadata.get("total_cost"))
         self._log_to_ledger(call_type="invoke", prompt=resolved, metadata=metadata)
         return metadata if self.structured_output else response_text
 
@@ -731,6 +748,7 @@ class OpenAIChatModel(BaseLLM):
         image_detail: Optional[str] = None,
     ) -> Any:
         """Async version of invoke()."""
+        self._check_budget()
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
@@ -753,6 +771,7 @@ class OpenAIChatModel(BaseLLM):
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
+        self._record_session_cost(metadata.get("total_cost"))
         self._log_to_ledger(call_type="ainvoke", prompt=resolved, metadata=metadata)
         return metadata if self.structured_output else response_text
 
@@ -813,6 +832,7 @@ class OpenAIChatModel(BaseLLM):
                 after ``max_validation_retries`` correction attempts.
         """
         self._require_structured_schema()
+        self._check_budget()
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
@@ -837,6 +857,7 @@ class OpenAIChatModel(BaseLLM):
                 output_pricing=self.output_pricing,
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
+            self._record_session_cost(self.last_metadata.get("total_cost"))
             self._log_to_ledger(call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata)
             return validated
 
@@ -858,6 +879,7 @@ class OpenAIChatModel(BaseLLM):
     ) -> Any:
         """Async version of invoke_structured()."""
         self._require_structured_schema()
+        self._check_budget()
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
@@ -882,6 +904,7 @@ class OpenAIChatModel(BaseLLM):
                 output_pricing=self.output_pricing,
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
+            self._record_session_cost(self.last_metadata.get("total_cost"))
             self._log_to_ledger(call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata)
             return validated
 

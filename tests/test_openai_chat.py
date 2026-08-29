@@ -957,3 +957,60 @@ def test_ledger_write_failure_does_not_break_invoke(tmp_path):
     llm._ledger_conn.close()  # simulate a broken/unwritable ledger
     llm._client.chat.completions.create.return_value = make_completion("Paris")
     assert llm.invoke("hi") == "Paris"
+
+
+# ── 21. Budget governor ──────────────────────────────────────────────────────
+
+from autourgos_openaichat import BudgetExceededException
+
+
+def test_max_session_cost_requires_both_pricings():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", max_session_cost=1.0, input_pricing=1.0)
+
+
+def test_budget_governor_allows_calls_under_cap():
+    llm = make_llm(input_pricing=1000, output_pricing=1000, max_session_cost=10.0)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")  # usage (9, 10, 19)
+    assert llm.invoke("hi") == "Paris"
+    assert llm.invoke("hi again") == "Paris"
+    assert llm._client.chat.completions.create.call_count == 2
+
+
+def test_budget_governor_blocks_once_cap_reached():
+    # each call costs (9/1e6)*1000 + (10/1e6)*1000 = 0.019; cap is below that.
+    llm = make_llm(input_pricing=1000, output_pricing=1000, max_session_cost=0.01)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"  # 1st call goes through, pushes usage over the cap
+    assert llm.session_cost_used >= 0.01
+
+    with pytest.raises(BudgetExceededException):
+        llm.invoke("hi again")
+    assert llm._client.chat.completions.create.call_count == 1  # 2nd call never reached the API
+
+
+def test_reset_session_budget_unblocks():
+    llm = make_llm(input_pricing=1000, output_pricing=1000, max_session_cost=0.01)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("hi")
+    with pytest.raises(BudgetExceededException):
+        llm.invoke("hi again")
+
+    llm.reset_session_budget()
+    assert llm.session_cost_used == 0.0
+    assert llm.invoke("hi again") == "Paris"
+
+
+def test_budget_exceeded_does_not_trip_circuit_breaker():
+    llm = make_llm(
+        input_pricing=1000, output_pricing=1000, max_session_cost=0.01,
+        circuit_failure_threshold=1,
+    )
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("hi")
+    for _ in range(3):
+        with pytest.raises(BudgetExceededException):
+            llm.invoke("hi again")
+
+    llm.reset_session_budget()
+    assert llm.invoke("hi again") == "Paris"  # circuit breaker never tripped
