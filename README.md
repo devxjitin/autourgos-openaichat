@@ -30,6 +30,7 @@ print(reply)
 - Prompt templates with `{placeholder}` variables
 - Multi-turn conversations via a plain message list
 - Automatic retries with exponential back-off, plus a circuit breaker for cascading-failure protection
+- Automatic provider fallback chain: define backup providers and `invoke()` transparently switches to them if the primary fails, no proxy/gateway needed
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -70,6 +71,7 @@ print(reply)
   - [Cost Tracking](#cost-tracking)
   - [Context Manager](#context-manager)
   - [Circuit Breaker](#circuit-breaker)
+  - [Provider Fallback Chain](#provider-fallback-chain)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -877,6 +879,58 @@ except CircuitBreakerOpenException as e:
 
 The circuit automatically resets after the cooldown and allows one probe call through.
 
+### Provider Fallback Chain
+
+Configure backup providers that `invoke()`, `ainvoke()`, `stream()`, `astream()`, `invoke_with_tools()`, and `ainvoke_with_tools()` transparently switch to if the primary provider fails (after its own retries are exhausted) — no proxy or gateway service needed.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    api_key="sk-...",                       # primary: OpenAI
+    fallback_providers=[
+        {
+            "model": "llama3-70b-8192",     # 1st backup: Groq
+            "api_key": "gsk_...",
+            "base_url": "https://api.groq.com/openai/v1",
+        },
+        {
+            "model": "llama3",              # 2nd backup: local Ollama
+            "api_key": "ollama",
+            "base_url": "http://localhost:11434/v1",
+        },
+    ],
+)
+
+reply = llm.invoke("What is the capital of France?")
+print(reply)
+# Paris (served by whichever provider succeeded first)
+
+print(llm.last_metadata["provider_used"])
+# "primary"  or  "fallback[0]:llama3-70b-8192"  or  "fallback[1]:llama3"
+```
+
+Each fallback entry resolves its own `api_key`/`base_url` (falling back to `OPENAI_API_KEY`/`OPENAI_BASE_URL` env vars, exactly like the primary) — nothing is inherited from the primary provider's credentials, so a backup on a different host never sees the primary's key.
+
+If every provider fails, `OpenAIChatModelAllProvidersFailedError` (a subclass of `OpenAIChatModelAPIError`) is raised with an `.attempts` list of `(label, exception)` pairs, one per provider tried:
+
+```python
+from autourgos_openaichat import OpenAIChatModelAllProvidersFailedError
+
+try:
+    llm.invoke("Hello!")
+except OpenAIChatModelAllProvidersFailedError as e:
+    for label, exc in e.attempts:
+        print(f"{label}: {exc}")
+    # primary: [primary] Chat Completions request failed after 3 attempts. ...
+    # fallback[0]:llama3-70b-8192: [fallback[0]:llama3-70b-8192] Chat Completions request failed ...
+```
+
+**Streaming limitation:** fallback only kicks in if a provider fails *before* it has streamed any text. Once partial output has already reached the caller, switching providers mid-stream would duplicate or corrupt the output, so the error is raised as-is instead of silently trying the next provider.
+
+`create()`/`acreate()` (low-level raw access) are unaffected by `fallback_providers` — they always call the primary client only, since their contract is "the raw response of the client you configured."
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -906,6 +960,7 @@ raw_response = await llm.acreate(messages)
 from autourgos_openaichat import (
     OpenAIChatModel,
     OpenAIChatModelAPIError,
+    OpenAIChatModelAllProvidersFailedError,
     OpenAIChatModelResponseError,
     OpenAIChatModelConfigError,
     OpenAIChatModelImportError,
@@ -916,6 +971,9 @@ llm = OpenAIChatModel(model="gpt-4o")
 
 try:
     reply = llm.invoke("Hello!")
+except OpenAIChatModelAllProvidersFailedError as e:
+    # Primary AND every configured fallback provider failed
+    print(f"All providers failed: {e.attempts}")
 except OpenAIChatModelAPIError as e:
     # API request failed after all retries
     print(f"API error: {e}")
@@ -979,6 +1037,7 @@ llm = OpenAIChatModel(
 | `output_pricing` | `float` | `None` | USD per 1 million output tokens |
 | `circuit_failure_threshold` | `int` | `5` | Consecutive failures before the circuit opens |
 | `circuit_cooldown_time` | `float` | `30.0` | Seconds the circuit stays open before probing |
+| `fallback_providers` | `list[dict]` | `None` | Ordered backup providers, each `{"model", "api_key"?, "base_url"?, "organization"?, "project"?}`, tried after the primary exhausts its retries |
 
 ---
 
@@ -1030,6 +1089,7 @@ llm = OpenAIChatModel(
 | `"output_cost"` | `float` | Output cost in USD (only if `output_pricing` set) |
 | `"total_cost"` | `float` | Total cost in USD (only if both pricing set) |
 | `"latency_ms"` | `float` | Request round-trip time in milliseconds |
+| `"provider_used"` | `str` | `"primary"` or `"fallback[N]:<model>"` — which provider actually served the request |
 
 ---
 

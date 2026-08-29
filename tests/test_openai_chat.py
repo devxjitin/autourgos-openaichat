@@ -685,3 +685,111 @@ def test_multimodal_path_read_failure_falls_back_to_url_treatment():
     llm.invoke("desc", files=["not-a-real-path-on-disk.jpg"])
     messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
     assert messages[0]["content"][1]["image_url"]["url"] == "not-a-real-path-on-disk.jpg"
+
+
+# ── 18. Provider fallback chain ─────────────────────────────────────────────
+
+from autourgos_openaichat import OpenAIChatModelAllProvidersFailedError
+
+
+def make_llm_with_fallback(fallback_models=("backup-model",), **kwargs):
+    """Construct an OpenAIChatModel with a mocked primary and mocked fallback clients."""
+    llm = OpenAIChatModel(
+        model="gpt-4o",
+        api_key="sk-test",
+        fallback_providers=[{"model": m, "api_key": "sk-backup"} for m in fallback_models],
+        **kwargs,
+    )
+    llm._client = MagicMock()
+    llm._async_client = MagicMock()
+    llm._async_client.chat.completions.create = AsyncMock()
+    for i in range(len(fallback_models)):
+        fb_sync = MagicMock()
+        fb_async = MagicMock()
+        fb_async.chat.completions.create = AsyncMock()
+        llm._fallback_sync_clients[i] = fb_sync
+        llm._fallback_async_clients[i] = fb_async
+    return llm
+
+
+def test_fallback_config_missing_model_raises():
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(model="gpt-4o", api_key="sk-test", fallback_providers=[{"api_key": "x"}])
+
+
+def test_fallback_not_used_when_primary_succeeds():
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    result = llm.invoke("hi")
+    assert result == "Paris"
+    assert llm.last_metadata["provider_used"] == "primary"
+    llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
+
+
+def test_fallback_used_when_primary_fails():
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("Berlin")
+    result = llm.invoke("hi")
+    assert result == "Berlin"
+    assert llm.last_metadata["provider_used"] == "fallback[0]:backup-model"
+    sent_model = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs["model"]
+    assert sent_model == "backup-model"
+
+
+def test_ainvoke_uses_fallback_on_primary_failure():
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._async_client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_async_clients[0].chat.completions.create.return_value = make_completion("Tokyo")
+
+    async def run():
+        return await llm.ainvoke("hi")
+
+    assert asyncio.run(run()) == "Tokyo"
+    assert llm.last_metadata["provider_used"] == "fallback[0]:backup-model"
+
+
+def test_all_providers_fail_raises_aggregate_error():
+    llm = make_llm_with_fallback(fallback_models=["backup-1", "backup-2"], max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.side_effect = RuntimeError("backup-1 down")
+    llm._fallback_sync_clients[1].chat.completions.create.side_effect = RuntimeError("backup-2 down")
+
+    with pytest.raises(OpenAIChatModelAllProvidersFailedError) as exc_info:
+        llm.invoke("hi")
+    assert len(exc_info.value.attempts) == 3
+    labels = [label for label, _ in exc_info.value.attempts]
+    assert labels == ["primary", "fallback[0]:backup-1", "fallback[1]:backup-2"]
+
+
+def test_invoke_with_tools_uses_fallback_on_primary_failure():
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("sunny")
+    response = llm.invoke_with_tools("weather?", [{"name": "get_weather", "parameters": {}}])
+    assert response.text == "sunny"
+
+
+def test_stream_fallback_before_any_chunk_emitted():
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["Hel", "lo"])
+    )
+    assert list(llm.stream("hi")) == ["Hel", "lo"]
+
+
+def test_stream_no_fallback_after_partial_emit():
+    """Once a provider has streamed partial text, a mid-stream failure must not
+    silently switch to the fallback provider (would duplicate/corrupt output)."""
+
+    def failing_stream(**kwargs):
+        yield from make_stream_chunks(["Hel"])
+        raise RuntimeError("dropped mid-stream")
+
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.side_effect = lambda **kwargs: failing_stream(**kwargs)
+
+    with pytest.raises(OpenAIChatModelAPIError, match="mid-response"):
+        list(llm.stream("hi"))
+    llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()

@@ -25,6 +25,7 @@ Quick start::
 
 from .chat import (
     OpenAIChatModel,
+    OpenAIChatModelAllProvidersFailedError,
     OpenAIChatModelAPIError,
     OpenAIChatModelConfigError,
     OpenAIChatModelError,
@@ -55,6 +56,7 @@ __all__ = [
     "OpenAIChatModelImportError",
     "OpenAIChatModelResponseError",
     "OpenAIChatModelConfigError",
+    "OpenAIChatModelAllProvidersFailedError",
     # Base types
     "BaseLLM",
     "FunctionCall",

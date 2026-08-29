@@ -66,6 +66,20 @@ class OpenAIChatModelConfigError(OpenAIChatModelError):
     """Raised for incompatible configuration options."""
 
 
+class OpenAIChatModelAllProvidersFailedError(OpenAIChatModelAPIError):
+    """
+    Raised when the primary provider and every configured fallback provider
+    have all failed for the same request.
+
+    ``.attempts`` holds one (label, exception) pair per provider that was
+    tried, in the order they were attempted.
+    """
+
+    def __init__(self, message: str, attempts: List[Any]) -> None:
+        super().__init__(message)
+        self.attempts = attempts
+
+
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class OpenAIChatModel(BaseLLM):
@@ -130,6 +144,7 @@ class OpenAIChatModel(BaseLLM):
         output_pricing: Optional[float] = None,
         circuit_failure_threshold: int = 5,
         circuit_cooldown_time: float = 30.0,
+        fallback_providers: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         """
         Args:
@@ -155,6 +170,12 @@ class OpenAIChatModel(BaseLLM):
             output_pricing: USD per 1 million output tokens (for cost tracking).
             circuit_failure_threshold: Consecutive failures before the circuit opens.
             circuit_cooldown_time: Seconds the circuit stays open before a probe attempt.
+            fallback_providers: Ordered list of backup providers to try, each a dict with
+                "model" (required) and optional "api_key" / "base_url" / "organization" /
+                "project". Tried in order after the primary provider exhausts its retries.
+                Each entry resolves its own api_key/base_url independently (falling back to
+                OPENAI_API_KEY/OPENAI_BASE_URL env vars, same as the primary) — nothing is
+                inherited from the primary provider's credentials.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -184,6 +205,15 @@ class OpenAIChatModel(BaseLLM):
             raise OpenAIChatModelConfigError(
                 "structured_output=True is incompatible with streaming=True."
             )
+
+        for i, entry in enumerate(fallback_providers or []):
+            if not entry.get("model"):
+                raise OpenAIChatModelConfigError(
+                    f"fallback_providers[{i}] is missing required key 'model'."
+                )
+        self.fallback_providers: List[Dict[str, Any]] = list(fallback_providers or [])
+        self._fallback_sync_clients: Dict[int, Any] = {}
+        self._fallback_async_clients: Dict[int, Any] = {}
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -217,6 +247,54 @@ class OpenAIChatModel(BaseLLM):
             timeout=self.timeout,
         )
 
+    def _get_fallback_sync_client(self, index: int) -> Any:
+        """Lazily create and cache the sync client for fallback_providers[index]."""
+        if index not in self._fallback_sync_clients:
+            cfg = self.fallback_providers[index]
+            self._fallback_sync_clients[index] = configure_openai_client(
+                openai_cls,
+                api_key=resolve_api_key(cfg.get("api_key")),
+                base_url=resolve_base_url(cfg.get("base_url")),
+                organization=cfg.get("organization"),
+                project=cfg.get("project"),
+                timeout=self.timeout,
+            )
+        return self._fallback_sync_clients[index]
+
+    def _get_fallback_async_client(self, index: int) -> Any:
+        """Lazily create and cache the async client for fallback_providers[index]."""
+        if index not in self._fallback_async_clients:
+            cfg = self.fallback_providers[index]
+            self._fallback_async_clients[index] = configure_async_openai_client(
+                async_openai_cls,
+                api_key=resolve_api_key(cfg.get("api_key")),
+                base_url=resolve_base_url(cfg.get("base_url")),
+                organization=cfg.get("organization"),
+                project=cfg.get("project"),
+                timeout=self.timeout,
+            )
+        return self._fallback_async_clients[index]
+
+    def _sync_targets(self) -> Iterator[tuple]:
+        """Yield (label, model_name, client) for the primary, then each fallback in order."""
+        yield "primary", self._model_name, self._client
+        for i, cfg in enumerate(self.fallback_providers):
+            yield (
+                f"fallback[{i}]:{cfg['model']}",
+                normalize_model_name(cfg["model"]),
+                self._get_fallback_sync_client(i),
+            )
+
+    def _async_targets(self) -> Iterator[tuple]:
+        """Yield (label, model_name, client) for the primary, then each fallback in order."""
+        yield "primary", self._model_name, self._async_client
+        for i, cfg in enumerate(self.fallback_providers):
+            yield (
+                f"fallback[{i}]:{cfg['model']}",
+                normalize_model_name(cfg["model"]),
+                self._get_fallback_async_client(i),
+            )
+
     # ── Context managers ──────────────────────────────────────────────────────
 
     def __enter__(self) -> "OpenAIChatModel":
@@ -226,6 +304,9 @@ class OpenAIChatModel(BaseLLM):
         if self._client is not None:
             release_openai_client(self._client)
             self._client = None
+        for client in self._fallback_sync_clients.values():
+            release_openai_client(client)
+        self._fallback_sync_clients = {}
 
     async def __aenter__(self) -> "OpenAIChatModel":
         return self
@@ -237,6 +318,12 @@ class OpenAIChatModel(BaseLLM):
         if self._client is not None:
             release_openai_client(self._client)
             self._client = None
+        for client in self._fallback_async_clients.values():
+            await release_async_openai_client(client)
+        self._fallback_async_clients = {}
+        for client in self._fallback_sync_clients.values():
+            release_openai_client(client)
+        self._fallback_sync_clients = {}
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
@@ -308,139 +395,234 @@ class OpenAIChatModel(BaseLLM):
             stream=stream,
         )
 
-    # ── Raw API calls ─────────────────────────────────────────────────────────
+    # ── Raw API calls (single client, with retry/back-off) ──────────────────────
 
-    def _create_raw(self, params: Dict[str, Any]) -> Any:
+    def _attempt_sync_create(self, client: Any, params: Dict[str, Any], label: str) -> Any:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                return self._client.chat.completions.create(**params)
+                return client.chat.completions.create(**params)
             except Exception as exc:
                 last_exc = exc
                 status_code = getattr(exc, "status_code", None)
                 if status_code in _NON_RETRYABLE_STATUS_CODES:
                     raise OpenAIChatModelAPIError(
-                        f"Chat Completions request failed with non-retryable status "
+                        f"[{label}] Chat Completions request failed with non-retryable status "
                         f"{status_code}. Error: {type(exc).__name__}: {exc}"
                     ) from exc
                 if attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
-                        f"Chat Completions request failed after {self.max_retries} attempts. "
-                        f"Last error: {type(exc).__name__}: {exc}"
+                        f"[{label}] Chat Completions request failed after {self.max_retries} "
+                        f"attempts. Last error: {type(exc).__name__}: {exc}"
                     ) from exc
                 time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError("Unexpected retry exhaustion") from last_exc
+        raise OpenAIChatModelAPIError(f"[{label}] Unexpected retry exhaustion") from last_exc
 
-    async def _acreate_raw(self, params: Dict[str, Any]) -> Any:
+    async def _attempt_async_create(self, client: Any, params: Dict[str, Any], label: str) -> Any:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                return await self._async_client.chat.completions.create(**params)
+                return await client.chat.completions.create(**params)
             except Exception as exc:
                 last_exc = exc
                 status_code = getattr(exc, "status_code", None)
                 if status_code in _NON_RETRYABLE_STATUS_CODES:
                     raise OpenAIChatModelAPIError(
-                        f"Async Chat Completions request failed with non-retryable status "
-                        f"{status_code}. Error: {type(exc).__name__}: {exc}"
+                        f"[{label}] Async Chat Completions request failed with non-retryable "
+                        f"status {status_code}. Error: {type(exc).__name__}: {exc}"
                     ) from exc
                 if attempt == self.max_retries:
                     raise OpenAIChatModelAPIError(
-                        f"Async Chat Completions request failed after {self.max_retries} attempts. "
-                        f"Last error: {type(exc).__name__}: {exc}"
+                        f"[{label}] Async Chat Completions request failed after "
+                        f"{self.max_retries} attempts. Last error: {type(exc).__name__}: {exc}"
                     ) from exc
                 await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError("Unexpected async retry exhaustion") from last_exc
+        raise OpenAIChatModelAPIError(f"[{label}] Unexpected async retry exhaustion") from last_exc
+
+    def _create_raw(self, params: Dict[str, Any]) -> Any:
+        return self._attempt_sync_create(self._client, params, "primary")
+
+    async def _acreate_raw(self, params: Dict[str, Any]) -> Any:
+        return await self._attempt_async_create(self._async_client, params, "primary")
+
+    # ── Raw API calls across primary + fallback providers ───────────────────────
+
+    def _create_across_providers(self, params: Dict[str, Any]) -> tuple:
+        """Try the primary, then each fallback provider in order. Returns (raw, label)."""
+        attempts: List[Any] = []
+        for label, model_name, client in self._sync_targets():
+            attempt_params = dict(params)
+            attempt_params["model"] = model_name
+            try:
+                return self._attempt_sync_create(client, attempt_params, label), label
+            except OpenAIChatModelAPIError as exc:
+                attempts.append((label, exc))
+        if len(attempts) == 1:
+            raise attempts[0][1]
+        raise OpenAIChatModelAllProvidersFailedError(
+            f"All {len(attempts)} provider(s) failed: "
+            + "; ".join(f"{label}: {exc}" for label, exc in attempts),
+            attempts=attempts,
+        )
+
+    async def _acreate_across_providers(self, params: Dict[str, Any]) -> tuple:
+        """Try the primary, then each fallback provider in order. Returns (raw, label)."""
+        attempts: List[Any] = []
+        for label, model_name, client in self._async_targets():
+            attempt_params = dict(params)
+            attempt_params["model"] = model_name
+            try:
+                return await self._attempt_async_create(client, attempt_params, label), label
+            except OpenAIChatModelAPIError as exc:
+                attempts.append((label, exc))
+        if len(attempts) == 1:
+            raise attempts[0][1]
+        raise OpenAIChatModelAllProvidersFailedError(
+            f"All {len(attempts)} provider(s) failed: "
+            + "; ".join(f"{label}: {exc}" for label, exc in attempts),
+            attempts=attempts,
+        )
 
     # ── Non-stream invocation ─────────────────────────────────────────────────
 
     def _invoke_non_stream(self, *, messages: List[Dict[str, Any]]) -> Any:
         params = self._build_base_params(messages=messages, stream=False)
-        resp = self._create_raw(params)
+        resp, provider_label = self._create_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
-            return text, resp
+            return text, resp, provider_label
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the Chat Completions response."
         )
 
     async def _ainvoke_non_stream(self, *, messages: List[Dict[str, Any]]) -> Any:
         params = self._build_base_params(messages=messages, stream=False)
-        resp = await self._acreate_raw(params)
+        resp, provider_label = await self._acreate_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
-            return text, resp
+            return text, resp, provider_label
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the async Chat Completions response."
         )
 
     # ── Streaming ─────────────────────────────────────────────────────────────
+    # Fallback only kicks in if a target fails before it has emitted any chunk —
+    # once partial text has reached the caller, switching providers mid-stream
+    # would duplicate or corrupt output, so the error is raised as-is instead.
 
     def _invoke_stream_mode(self, *, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        params = self._build_base_params(messages=messages, stream=True)
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            emitted = False
-            try:
-                stream = self._client.chat.completions.create(**params)
-                for event in stream:
-                    delta = extract_text_delta_from_event(event)
-                    if delta:
-                        emitted = True
-                        yield delta
-                if emitted:
-                    return
-                raise OpenAIChatModelResponseError("No text deltas in streaming response")
-            except (OpenAIChatModelResponseError, OpenAIChatModelAPIError):
-                raise
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise OpenAIChatModelAPIError(
-                        f"Streaming failed with non-retryable status {status_code}. "
-                        f"Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if emitted or attempt == self.max_retries:
-                    raise OpenAIChatModelAPIError(
-                        f"Streaming failed after {attempt} attempt(s). "
-                        f"Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError("Streaming failed unexpectedly") from last_exc
+        base_params = self._build_base_params(messages=messages, stream=True)
+        attempts: List[Any] = []
+        for label, model_name, client in self._sync_targets():
+            params = dict(base_params)
+            params["model"] = model_name
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, self.max_retries + 1):
+                emitted = False
+                try:
+                    stream = client.chat.completions.create(**params)
+                    for event in stream:
+                        delta = extract_text_delta_from_event(event)
+                        if delta:
+                            emitted = True
+                            yield delta
+                    if emitted:
+                        return
+                    raise OpenAIChatModelResponseError(f"[{label}] No text deltas in streaming response")
+                except OpenAIChatModelResponseError as exc:
+                    if emitted:
+                        raise
+                    last_exc = exc
+                    break
+                except Exception as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    if emitted:
+                        raise OpenAIChatModelAPIError(
+                            f"[{label}] Streaming failed mid-response after emitting output: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    if status_code in _NON_RETRYABLE_STATUS_CODES:
+                        last_exc = OpenAIChatModelAPIError(
+                            f"[{label}] Streaming failed with non-retryable status {status_code}. "
+                            f"Error: {type(exc).__name__}: {exc}"
+                        )
+                        last_exc.__cause__ = exc
+                        break
+                    if attempt == self.max_retries:
+                        last_exc = OpenAIChatModelAPIError(
+                            f"[{label}] Streaming failed after {attempt} attempt(s). "
+                            f"Last error: {type(exc).__name__}: {exc}"
+                        )
+                        last_exc.__cause__ = exc
+                        break
+                    time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
+                    continue
+                break
+            attempts.append((label, last_exc))
+        if len(attempts) == 1:
+            raise attempts[0][1]
+        raise OpenAIChatModelAllProvidersFailedError(
+            f"Streaming failed on all {len(attempts)} provider(s): "
+            + "; ".join(f"{lbl}: {exc}" for lbl, exc in attempts),
+            attempts=attempts,
+        )
 
     async def _ainvoke_stream_mode(self, *, messages: List[Dict[str, Any]]) -> AsyncIterator[str]:
-        params = self._build_base_params(messages=messages, stream=True)
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            emitted = False
-            try:
-                stream = await self._async_client.chat.completions.create(**params)
-                async for event in stream:
-                    delta = extract_text_delta_from_event(event)
-                    if delta:
-                        emitted = True
-                        yield delta
-                if emitted:
-                    return
-                raise OpenAIChatModelResponseError("No text deltas in async streaming response")
-            except (OpenAIChatModelResponseError, OpenAIChatModelAPIError):
-                raise
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise OpenAIChatModelAPIError(
-                        f"Async streaming failed with non-retryable status {status_code}. "
-                        f"Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if emitted or attempt == self.max_retries:
-                    raise OpenAIChatModelAPIError(
-                        f"Async streaming failed after {attempt} attempt(s). "
-                        f"Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError("Async streaming failed unexpectedly") from last_exc
+        base_params = self._build_base_params(messages=messages, stream=True)
+        attempts: List[Any] = []
+        for label, model_name, client in self._async_targets():
+            params = dict(base_params)
+            params["model"] = model_name
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, self.max_retries + 1):
+                emitted = False
+                try:
+                    stream = await client.chat.completions.create(**params)
+                    async for event in stream:
+                        delta = extract_text_delta_from_event(event)
+                        if delta:
+                            emitted = True
+                            yield delta
+                    if emitted:
+                        return
+                    raise OpenAIChatModelResponseError(f"[{label}] No text deltas in async streaming response")
+                except OpenAIChatModelResponseError as exc:
+                    if emitted:
+                        raise
+                    last_exc = exc
+                    break
+                except Exception as exc:
+                    status_code = getattr(exc, "status_code", None)
+                    if emitted:
+                        raise OpenAIChatModelAPIError(
+                            f"[{label}] Async streaming failed mid-response after emitting output: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    if status_code in _NON_RETRYABLE_STATUS_CODES:
+                        last_exc = OpenAIChatModelAPIError(
+                            f"[{label}] Async streaming failed with non-retryable status {status_code}. "
+                            f"Error: {type(exc).__name__}: {exc}"
+                        )
+                        last_exc.__cause__ = exc
+                        break
+                    if attempt == self.max_retries:
+                        last_exc = OpenAIChatModelAPIError(
+                            f"[{label}] Async streaming failed after {attempt} attempt(s). "
+                            f"Last error: {type(exc).__name__}: {exc}"
+                        )
+                        last_exc.__cause__ = exc
+                        break
+                    await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
+                    continue
+                break
+            attempts.append((label, last_exc))
+        if len(attempts) == 1:
+            raise attempts[0][1]
+        raise OpenAIChatModelAllProvidersFailedError(
+            f"Async streaming failed on all {len(attempts)} provider(s): "
+            + "; ".join(f"{lbl}: {exc}" for lbl, exc in attempts),
+            attempts=attempts,
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -472,7 +654,7 @@ class OpenAIChatModel(BaseLLM):
             return "".join(self._invoke_stream_mode(messages=messages))
 
         with track_latency() as timing:
-            response_text, raw_response = self._invoke_non_stream(messages=messages)
+            response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
 
         metadata = build_structured_output(
             model_name=self._model_name,
@@ -481,6 +663,7 @@ class OpenAIChatModel(BaseLLM):
             latency_ms=timing["latency_ms"],
             input_pricing=self.input_pricing,
             output_pricing=self.output_pricing,
+            extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
         return metadata if self.structured_output else response_text
@@ -504,7 +687,7 @@ class OpenAIChatModel(BaseLLM):
             return "".join(chunks)
 
         with track_latency() as timing:
-            response_text, raw_response = await self._ainvoke_non_stream(messages=messages)
+            response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
 
         metadata = build_structured_output(
             model_name=self._model_name,
@@ -513,6 +696,7 @@ class OpenAIChatModel(BaseLLM):
             latency_ms=timing["latency_ms"],
             input_pricing=self.input_pricing,
             output_pricing=self.output_pricing,
+            extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
         return metadata if self.structured_output else response_text
@@ -640,7 +824,7 @@ class OpenAIChatModel(BaseLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
-        raw = self._create_raw(params)
+        raw, _provider_label = self._create_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)
@@ -662,7 +846,7 @@ class OpenAIChatModel(BaseLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = kwargs.get("tool_choice", "auto")
-        raw = await self._acreate_raw(params)
+        raw, _provider_label = await self._acreate_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)
@@ -686,4 +870,5 @@ __all__ = [
     "OpenAIChatModelImportError",
     "OpenAIChatModelResponseError",
     "OpenAIChatModelConfigError",
+    "OpenAIChatModelAllProvidersFailedError",
 ]

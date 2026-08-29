@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.1.0] - 2026-08-29
+
+- Added: automatic provider fallback chain via a new `fallback_providers=` constructor param — `invoke()`, `ainvoke()`, `stream()`, `astream()`, `invoke_with_tools()`, and `ainvoke_with_tools()` now transparently retry against ordered backup providers if the primary exhausts its retries, with no proxy/gateway service required. Each fallback entry resolves its own `api_key`/`base_url` independently (no credential inheritance from the primary). Streaming fallback only triggers before any chunk has been emitted, to avoid duplicating/corrupting partial output already sent to the caller.
+- Added: `OpenAIChatModelAllProvidersFailedError` (subclass of `OpenAIChatModelAPIError`) raised when the primary and every fallback provider fail, carrying an `.attempts` list of `(label, exception)` pairs.
+- Added: `"provider_used"` key in the structured-output metadata dict / `llm.last_metadata`, identifying which provider (`"primary"` or `"fallback[N]:<model>"`) actually served the request.
+- Non-breaking: with `fallback_providers` unset (the default), behavior and exception types are unchanged from 2.0.1. Added 8 new tests covering fallback success, exhaustion, tool calling, and the streaming pre/post-emit boundary (65 total).
+
 ## [2.0.1] - 2026-08-29
 
 - Maintenance release: no functional or documentation changes. Version bump to keep in step with the `autourgos-responses` companion package release.
