@@ -36,6 +36,7 @@ print(reply)
 - Budget governor: set a hard USD cap and further calls are blocked once accumulated session cost reaches it
 - Optional PII/secret redaction: heuristic pre-flight scrubber masks (or blocks) emails, API keys, credit cards, SSNs, and phone numbers before they leave the process
 - Shadow-mode dual dispatch: compare the primary against backup providers concurrently, for observation only — invoke() always returns the primary's answer
+- `extra_body=` passthrough for provider-specific request fields — e.g. vLLM's `guided_json`/`guided_regex` or llama.cpp's `grammar` for constrained decoding
 - Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
@@ -82,6 +83,7 @@ print(reply)
   - [Budget Governor](#budget-governor)
   - [PII / Secret Redaction](#pii--secret-redaction)
   - [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)
+  - [Constrained Decoding / Provider-Specific Params](#constrained-decoding--provider-specific-params)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -1231,6 +1233,47 @@ Notes:
 - Only `invoke()`/`ainvoke()` dispatch shadows in this version — `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()` don't.
 - If [Call Ledger](#call-ledger-audit-trail) is enabled, every shadow result is also recorded in a separate `shadow_calls` table.
 
+### Constrained Decoding / Provider-Specific Params
+
+Self-hosted OpenAI-compatible servers (vLLM, llama.cpp, and others) support extra, non-standard request fields for constrained/guided generation — forcing output to match a JSON schema, a regex, a fixed set of choices, or a formal grammar. These aren't part of the OpenAI API, so the `openai` SDK exposes them via `extra_body=`. Set `extra_body=` on the constructor to merge your own fields into **every** request this client makes (primary, fallback, and shadow providers alike).
+
+vLLM — force output to match a JSON schema (`guided_json`):
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(
+    model="meta-llama/Meta-Llama-3-8B-Instruct",
+    base_url="http://localhost:8000/v1",   # vLLM's OpenAI-compatible server
+    api_key="EMPTY",
+    extra_body={
+        "guided_json": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+            "required": ["name", "age"],
+        }
+    },
+)
+reply = llm.invoke("Give me a fictional person's name and age.")
+```
+
+vLLM also supports `guided_regex` and `guided_choice` the same way. llama.cpp server — constrain with a GBNF grammar:
+
+```python
+llm = OpenAIChatModel(
+    model="local-model",
+    base_url="http://localhost:8080/v1",
+    api_key="not-needed",
+    extra_body={"grammar": 'root ::= "yes" | "no"'},
+)
+```
+
+Notes:
+- **Not validated or interpreted** by this library — whatever dict you pass is sent as-is. This library doesn't know or care what the keys mean.
+- **Not portable**: these fields are provider-specific. A provider that doesn't recognize a key will typically ignore it or reject the request — check your provider's docs. Mixing an `extra_body`-dependent client with [fallback providers](#provider-fallback-chain) on a different backend can silently break the guided behavior on the fallback (the same `extra_body` is sent to all of them).
+- This is a single, constructor-level setting — no per-call override in this version. It composes automatically with the [Provider Fallback Chain](#provider-fallback-chain) and [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch), since every target reuses the same base request params.
+- `output_schema=` (this library's own structured-output feature) and `extra_body={"guided_json": ...}` solve a similar problem differently: `output_schema` uses the *standard* OpenAI `response_format` (works on OpenAI, Azure, and any provider that implements strict JSON-schema mode), while `guided_json` is vLLM's own mechanism for providers that don't. Use whichever your provider actually supports — you generally don't need both at once.
+
 ### Low-Level Access
 
 If you need direct access to the raw OpenAI response object:
@@ -1358,6 +1401,7 @@ llm = OpenAIChatModel(
 | `redact_restore_in_response` | `bool` | `False` | Swap echoed placeholders back for their original values in the returned text/ledger-excluded response. Requires `redact_pii=True` and `redact_mode="mask"` |
 | `shadow_providers` | `list[dict]` | `None` | Backup providers dispatched concurrently for observation only (see [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)) |
 | `on_shadow_result` | `Callable[[dict], None]` | `None` | Callback invoked with each shadow result dict as it completes |
+| `extra_body` | `dict` | `None` | Raw provider-specific request fields merged into every request (see [Constrained Decoding](#constrained-decoding--provider-specific-params)) |
 
 ---
 

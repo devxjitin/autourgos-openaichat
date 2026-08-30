@@ -195,6 +195,7 @@ class OpenAIChatModel(BaseLLM):
         redact_restore_in_response: bool = False,
         shadow_providers: Optional[List[Dict[str, Any]]] = None,
         on_shadow_result: Optional[Callable[[Dict[str, Any]], None]] = None,
+        extra_body: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Args:
@@ -276,6 +277,11 @@ class OpenAIChatModel(BaseLLM):
                 max_session_cost. Only invoke()/ainvoke() dispatch shadows in this version.
             on_shadow_result: Optional callback invoked with each shadow result dict as it
                 completes.
+            extra_body: Raw provider-specific request fields merged into every request
+                (primary, fallback, and shadow) — e.g. vLLM's guided_json/guided_regex/
+                guided_choice for constrained decoding, or llama.cpp's grammar. Not
+                validated or interpreted by this library, and not portable across
+                providers that don't recognize the same keys. None (default) adds nothing.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -367,6 +373,8 @@ class OpenAIChatModel(BaseLLM):
         self.last_shadow_results: List[Dict[str, Any]] = []
         self._shadow_sync_clients: Dict[int, Any] = {}
         self._shadow_async_clients: Dict[int, Any] = {}
+
+        self.extra_body = extra_body
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -776,7 +784,7 @@ class OpenAIChatModel(BaseLLM):
             output_schema=self.output_schema,
             response_mime_type=self.response_mime_type,
         )
-        return build_chat_completion_create_params(
+        params = build_chat_completion_create_params(
             self._model_name,
             messages,
             temperature=self.temperature,
@@ -785,6 +793,9 @@ class OpenAIChatModel(BaseLLM):
             response_format=response_format,
             stream=stream,
         )
+        if self.extra_body:
+            params["extra_body"] = dict(self.extra_body)
+        return params
 
     # ── Raw API calls (single client, with retry/back-off) ──────────────────────
 

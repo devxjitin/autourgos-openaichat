@@ -1417,3 +1417,64 @@ def test_redact_inline_custom_patterns_override_file_on_name_collision():
         sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
         assert "PROJECT-42" in sent[0]["content"]       # file pattern was overridden, no longer matches
         assert "OVERRIDE-99" not in sent[0]["content"]  # inline pattern wins
+
+
+# ── 26. Constrained decoding passthrough (extra_body) ────────────────────────
+
+def test_extra_body_absent_by_default():
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert "extra_body" not in kwargs
+
+
+def test_extra_body_sent_on_invoke():
+    guided = {"guided_json": {"type": "object", "properties": {"x": {"type": "string"}}}}
+    llm = make_llm(extra_body=guided)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["extra_body"] == guided
+
+
+def test_extra_body_sent_on_ainvoke_and_stream():
+    guided = {"grammar": 'root ::= "yes" | "no"'}
+    llm = make_llm(extra_body=guided)
+
+    llm._async_client.chat.completions.create.return_value = make_completion("ok")
+
+    async def run():
+        return await llm.ainvoke("hi")
+
+    asyncio.run(run())
+    assert llm._async_client.chat.completions.create.call_args.kwargs["extra_body"] == guided
+
+    llm._client.chat.completions.create.return_value = FakeSyncStream(make_stream_chunks(["hi"]))
+    list(llm.stream("hi"))
+    assert llm._client.chat.completions.create.call_args.kwargs["extra_body"] == guided
+
+
+def test_extra_body_sent_on_invoke_with_tools_and_invoke_structured():
+    guided = {"guided_choice": ["yes", "no"]}
+    llm = make_llm(extra_body=guided)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke_with_tools("hi", [{"name": "noop", "parameters": {}}])
+    assert llm._client.chat.completions.create.call_args.kwargs["extra_body"] == guided
+
+    llm2 = make_llm(extra_body=guided, output_schema=CityCountryInfo)
+    llm2._client.chat.completions.create.return_value = make_completion(
+        json.dumps({"city": "Tokyo", "country": "Japan"})
+    )
+    llm2.invoke_structured("hi")
+    assert llm2._client.chat.completions.create.call_args.kwargs["extra_body"] == guided
+
+
+def test_extra_body_propagates_to_fallback_provider():
+    guided = {"guided_json": {"type": "object"}}
+    llm = make_llm_with_fallback(extra_body=guided, max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    fb_kwargs = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs
+    assert fb_kwargs["extra_body"] == guided

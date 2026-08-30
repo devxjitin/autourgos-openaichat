@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.2.0] - 2026-08-30
+
+- Added: `extra_body=` on `OpenAIChatModel` — a raw passthrough dict merged into every request (primary, fallback, and shadow providers alike) via the single shared `_build_base_params()`. Lets provider-specific, non-standard fields reach self-hosted OpenAI-compatible servers — e.g. vLLM's `guided_json`/`guided_regex`/`guided_choice` for constrained/guided decoding, or llama.cpp's `grammar` (GBNF). Not validated or interpreted by the library, and not portable across providers that don't recognize the same keys. Constructor-level only (no per-call override in this version), consistent with how `temperature`/`system_prompt`/`output_schema` etc. already work.
+- Note: the low-level `create()`/`acreate()` methods already supported this via their existing `**overrides` passthrough — this release adds the same capability to the high-level convenience methods (`invoke`/`ainvoke`/`stream`/`astream`/`invoke_with_tools`/`ainvoke_with_tools`/`invoke_structured`/`ainvoke_structured`), which previously had no way to attach it.
+- Non-breaking: `extra_body=None` (the default) means the `extra_body` key is never added to outgoing request params — identical to 2.1.0. 5 new tests (119 total).
+
 ## [2.1.0] - 2026-08-30
 
 Consolidated feature release — eight additive capabilities layered on top of 2.0.1, none of them changing existing behavior, return types, or exception types when left at their default (off) settings.
