@@ -520,6 +520,21 @@ class OpenAIChatModel(BaseLLM):
         close_ledger(self._ledger_conn)
         self._ledger_conn = None
 
+    def close(self) -> None:
+        """
+        Release the underlying client(s) synchronously.
+
+        Equivalent to ``__exit__()`` — lets callers that hold this LLM via
+        composition (e.g. autourgos-agent's ``Agent``, whose context-manager
+        cleanup calls ``llm.close()``/``llm.aclose()`` if present) release
+        resources without needing to use ``with`` directly on this object.
+        """
+        self.__exit__()
+
+    async def aclose(self) -> None:
+        """Release the underlying client(s) asynchronously. Equivalent to ``__aexit__()``."""
+        await self.__aexit__()
+
     async def __aenter__(self) -> "OpenAIChatModel":
         return self
 
