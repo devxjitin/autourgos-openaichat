@@ -10,7 +10,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from string import Formatter
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, Optional
 import time
 
 

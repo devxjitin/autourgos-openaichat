@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -260,13 +259,13 @@ def test_multimodal_from_dict_url():
 
 # ── 9. Structured output ─────────────────────────────────────────────────────
 
-class CityInfo(BaseModel):
+class CityCountryInfo(BaseModel):
     city: str = Field(description="Name of the city")
     country: str = Field(description="Name of the country")
 
 
 def test_structured_output_with_pydantic_schema():
-    llm = make_llm(output_schema=CityInfo, structured_output=True)
+    llm = make_llm(output_schema=CityCountryInfo, structured_output=True)
     payload = json.dumps({"city": "Tokyo", "country": "Japan"})
     llm._client.chat.completions.create.return_value = make_completion(payload)
     result = llm.invoke("Tell me about Tokyo.")
@@ -274,7 +273,9 @@ def test_structured_output_with_pydantic_schema():
     assert json.loads(result["response"]) == {"city": "Tokyo", "country": "Japan"}
     kwargs = llm._client.chat.completions.create.call_args.kwargs
     assert kwargs["response_format"]["type"] == "json_schema"
-    assert kwargs["response_format"]["json_schema"]["name"] == "CityInfo"
+    assert kwargs["response_format"]["json_schema"]["name"] == "CityCountryInfo"
+    schema_properties = kwargs["response_format"]["json_schema"]["schema"]["properties"]
+    assert set(schema_properties.keys()) == {"city", "country"}
 
 
 def test_structured_streaming_incompatible_raises_at_construction():

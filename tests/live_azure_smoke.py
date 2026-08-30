@@ -27,8 +27,6 @@ from autourgos_openaichat import (
     OpenAIChatModel,
     OpenAIChatModelAPIError,
     OpenAIChatModelConfigError,
-    OpenAIChatModelResponseError,
-    CircuitBreakerOpenException,
 )
 
 ENDPOINT = os.environ["AZURE_OPENAI_ENDPOINT"]
