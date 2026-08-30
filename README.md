@@ -1410,10 +1410,10 @@ llm = OpenAIChatModel(
 
 | Method | Returns |
 |---|---|
-| `invoke(prompt)` | `str`, generated text (or `dict` if `structured_output=True`) |
-| `ainvoke(prompt)` | same as `invoke`, async |
-| `stream(prompt)` | `Iterator[str]`, text chunks |
-| `astream(prompt)` | `AsyncIterator[str]`, text chunks |
+| `invoke(prompt, **overrides)` | `str`, generated text (or `dict` if `structured_output=True`). `**overrides` (e.g. `temperature=`, `top_p=`, `max_tokens=`, `stop=`) apply to this call only, across the fallback chain; `"messages"`/`"model"`/`"stream"` can't be overridden this way |
+| `ainvoke(prompt, **overrides)` | same as `invoke`, async |
+| `stream(prompt, **overrides)` | `Iterator[str]`, text chunks. Same per-call `**overrides` as `invoke` |
+| `astream(prompt, **overrides)` | `AsyncIterator[str]`, text chunks. Same per-call `**overrides` as `invoke` |
 | `batch_invoke(prompts)` | `list[str]`, one result per prompt |
 | `abatch_invoke(prompts)` | `list[str]`, concurrent results |
 | `invoke_with_tools(prompt, tools)` | `ToolCallResponse`, `.tool_calls` list or `.text` |

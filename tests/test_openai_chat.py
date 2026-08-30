@@ -106,6 +106,50 @@ def test_invoke_passes_sampling_params():
     assert kwargs["max_tokens"] == 256
 
 
+def test_invoke_accepts_per_call_overrides():
+    # Mirrors autourgos-react-agent's AgentLoopMixin, which calls
+    # self.llm.invoke(messages, **call_kwargs) with per-iteration overrides
+    # (e.g. from an on_before_iteration middleware hook).
+    llm = make_llm(temperature=0.7)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi", temperature=0.1, stop=["Observation:"])
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.1  # per-call override wins over constructor default
+    assert kwargs["stop"] == ["Observation:"]
+
+
+def test_invoke_overrides_cannot_hijack_model_or_messages():
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi", model="not-a-real-model", messages=["hijacked"])
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-4o"
+    assert kwargs["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_ainvoke_accepts_per_call_overrides():
+    llm = make_llm()
+    llm._async_client.chat.completions.create.return_value = make_completion("ok")
+
+    async def run():
+        return await llm.ainvoke("hi", temperature=0.2, max_tokens=64)
+
+    asyncio.run(run())
+    kwargs = llm._async_client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["max_tokens"] == 64
+
+
+def test_invoke_streaming_mode_accepts_per_call_overrides():
+    llm = make_llm(streaming=True)
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["ok"])
+    )
+    llm.invoke("hi", temperature=0.3)
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.3
+
+
 # ── 2. Async generation (ainvoke) ───────────────────────────────────────────
 
 def test_ainvoke_basic_text():
@@ -144,6 +188,17 @@ def test_stream_raises_on_empty_stream():
         list(llm.stream("hi"))
 
 
+def test_stream_accepts_per_call_overrides():
+    llm = make_llm(temperature=0.7)
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["ok"])
+    )
+    list(llm.stream("hi", temperature=0.1, stop=["Observation:"]))
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.1
+    assert kwargs["stop"] == ["Observation:"]
+
+
 # ── 4. Async streaming ───────────────────────────────────────────────────────
 
 def test_astream_yields_chunks():
@@ -156,6 +211,21 @@ def test_astream_yields_chunks():
         return [c async for c in llm.astream("count")]
 
     assert asyncio.run(run()) == ["1... ", "2... ", "3..."]
+
+
+def test_astream_accepts_per_call_overrides():
+    llm = make_llm()
+    llm._async_client.chat.completions.create.return_value = FakeAsyncStream(
+        make_stream_chunks(["ok"])
+    )
+
+    async def run():
+        return [c async for c in llm.astream("hi", temperature=0.2, max_tokens=64)]
+
+    asyncio.run(run())
+    kwargs = llm._async_client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["max_tokens"] == 64
 
 
 # ── 5. Batch invocation ──────────────────────────────────────────────────────

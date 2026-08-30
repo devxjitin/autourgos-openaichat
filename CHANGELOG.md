@@ -1,5 +1,11 @@
 # Changelog
 
+## [2.3.0] - 2026-08-30
+
+- Fixed: `invoke()`/`ainvoke()`/`stream()`/`astream()` now accept `**overrides` (e.g. `temperature=`, `top_p=`, `max_tokens=`, `stop=`) merged over the constructor's defaults for that call only, applied consistently across the primary + fallback chain (and the internal streaming path when `streaming=True`). Previously these methods had a closed keyword signature (`prompt`, `prompt_variables`, `files`, `image_detail`) even though the abstract `BaseLLM` contract in `llm.py` declares `**kwargs` for all four, so any caller passing extra keywords — notably `autourgos-react-agent`'s `AgentLoopMixin`, which calls `self.llm.invoke(messages, **call_kwargs)` with per-iteration overrides from an `on_before_iteration` middleware hook — hit `TypeError: invoke() got an unexpected keyword argument`.
+- `"messages"`, `"model"`, and `"stream"` stay structurally managed and are dropped from `**overrides` before merging, since fallback dispatch depends on swapping `"model"` per target.
+- Non-breaking: calls with no extra keywords behave identically to 2.2.0. 6 new tests (125 total).
+
 ## [2.2.0] - 2026-08-30
 
 - Added: `extra_body=` on `OpenAIChatModel` — a raw passthrough dict merged into every request (primary, fallback, and shadow providers alike) via the single shared `_build_base_params()`. Lets provider-specific, non-standard fields reach self-hosted OpenAI-compatible servers — e.g. vLLM's `guided_json`/`guided_regex`/`guided_choice` for constrained/guided decoding, or llama.cpp's `grammar` (GBNF). Not validated or interpreted by the library, and not portable across providers that don't recognize the same keys. Constructor-level only (no per-call override in this version), consistent with how `temperature`/`system_prompt`/`output_schema` etc. already work.

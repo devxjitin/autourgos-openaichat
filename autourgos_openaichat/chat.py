@@ -779,7 +779,13 @@ class OpenAIChatModel(BaseLLM):
         messages.extend(build_multimodal_messages(prompt, files=files, image_detail=image_detail))
         return messages
 
-    def _build_base_params(self, *, messages: List[Dict[str, Any]], stream: bool) -> Dict[str, Any]:
+    def _build_base_params(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        stream: bool,
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         response_format = build_response_format(
             output_schema=self.output_schema,
             response_mime_type=self.response_mime_type,
@@ -795,6 +801,14 @@ class OpenAIChatModel(BaseLLM):
         )
         if self.extra_body:
             params["extra_body"] = dict(self.extra_body)
+        if overrides:
+            # "messages"/"model"/"stream" stay structurally managed (per-target
+            # model swap on fallback, non-stream vs. stream dispatch) — a caller
+            # override can't hijack those, only request params like temperature,
+            # top_p, max_tokens, stop, response_format.
+            params.update(
+                {k: v for k, v in overrides.items() if k not in ("messages", "model", "stream")}
+            )
         return params
 
     # ── Raw API calls (single client, with retry/back-off) ──────────────────────
@@ -887,8 +901,10 @@ class OpenAIChatModel(BaseLLM):
 
     # ── Non-stream invocation ─────────────────────────────────────────────────
 
-    def _invoke_non_stream(self, *, messages: List[Dict[str, Any]]) -> Any:
-        params = self._build_base_params(messages=messages, stream=False)
+    def _invoke_non_stream(
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
         resp, provider_label = self._create_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
@@ -897,8 +913,10 @@ class OpenAIChatModel(BaseLLM):
             "No text could be extracted from the Chat Completions response."
         )
 
-    async def _ainvoke_non_stream(self, *, messages: List[Dict[str, Any]]) -> Any:
-        params = self._build_base_params(messages=messages, stream=False)
+    async def _ainvoke_non_stream(
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
         resp, provider_label = await self._acreate_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
@@ -912,8 +930,10 @@ class OpenAIChatModel(BaseLLM):
     # once partial text has reached the caller, switching providers mid-stream
     # would duplicate or corrupt output, so the error is raised as-is instead.
 
-    def _invoke_stream_mode(self, *, messages: List[Dict[str, Any]]) -> Iterator[str]:
-        base_params = self._build_base_params(messages=messages, stream=True)
+    def _invoke_stream_mode(
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+    ) -> Iterator[str]:
+        base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
         attempts: List[Any] = []
         for label, model_name, client in self._sync_targets():
             params = dict(base_params)
@@ -969,8 +989,10 @@ class OpenAIChatModel(BaseLLM):
             attempts=attempts,
         )
 
-    async def _ainvoke_stream_mode(self, *, messages: List[Dict[str, Any]]) -> AsyncIterator[str]:
-        base_params = self._build_base_params(messages=messages, stream=True)
+    async def _ainvoke_stream_mode(
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+    ) -> AsyncIterator[str]:
+        base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
         attempts: List[Any] = []
         for label, model_name, client in self._async_targets():
             params = dict(base_params)
@@ -1035,6 +1057,7 @@ class OpenAIChatModel(BaseLLM):
         *,
         files: Optional[Any] = None,
         image_detail: Optional[str] = None,
+        **overrides: Any,
     ) -> Any:
         """
         Generate a response synchronously.
@@ -1045,6 +1068,11 @@ class OpenAIChatModel(BaseLLM):
             prompt_variables: Variables to fill prompt_template placeholders.
             files: Image file paths, bytes, or dicts to include as vision input.
             image_detail: OpenAI image detail level — "low", "high", or "auto".
+            **overrides: Per-call request params merged over the constructor's
+                defaults for this call only — e.g. temperature=, top_p=,
+                max_tokens=, stop=. Applied to every provider in the fallback
+                chain; "messages"/"model"/"stream" are structurally managed and
+                cannot be overridden this way.
 
         Returns:
             Generated text string, or a metadata dict if structured_output=True.
@@ -1054,10 +1082,12 @@ class OpenAIChatModel(BaseLLM):
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
         if self.streaming:
-            return "".join(self._invoke_stream_mode(messages=messages))
+            return "".join(self._invoke_stream_mode(messages=messages, overrides=overrides))
 
         with track_latency() as timing:
-            response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
+            response_text, raw_response, provider_label = self._invoke_non_stream(
+                messages=messages, overrides=overrides
+            )
 
         masked_response_text = response_text
         if self.redact_restore_in_response:
@@ -1087,20 +1117,23 @@ class OpenAIChatModel(BaseLLM):
         *,
         files: Optional[Any] = None,
         image_detail: Optional[str] = None,
+        **overrides: Any,
     ) -> Any:
-        """Async version of invoke()."""
+        """Async version of invoke(). See invoke() for **overrides semantics."""
         self._check_budget()
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
         if self.streaming:
             chunks: List[str] = []
-            async for delta in self._ainvoke_stream_mode(messages=messages):
+            async for delta in self._ainvoke_stream_mode(messages=messages, overrides=overrides):
                 chunks.append(delta)
             return "".join(chunks)
 
         with track_latency() as timing:
-            response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
+            response_text, raw_response, provider_label = await self._ainvoke_non_stream(
+                messages=messages, overrides=overrides
+            )
 
         masked_response_text = response_text
         if self.redact_restore_in_response:
@@ -1288,11 +1321,12 @@ class OpenAIChatModel(BaseLLM):
         *,
         files: Optional[Any] = None,
         image_detail: Optional[str] = None,
+        **overrides: Any,
     ) -> Iterator[str]:
-        """Stream text chunks synchronously."""
+        """Stream text chunks synchronously. See invoke() for **overrides semantics."""
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-        return self._invoke_stream_mode(messages=messages)
+        return self._invoke_stream_mode(messages=messages, overrides=overrides)
 
     async def astream(
         self,
@@ -1301,11 +1335,12 @@ class OpenAIChatModel(BaseLLM):
         *,
         files: Optional[Any] = None,
         image_detail: Optional[str] = None,
+        **overrides: Any,
     ) -> AsyncIterator[str]:
-        """Stream text chunks asynchronously."""
+        """Stream text chunks asynchronously. See invoke() for **overrides semantics."""
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-        async for chunk in self._ainvoke_stream_mode(messages=messages):
+        async for chunk in self._ainvoke_stream_mode(messages=messages, overrides=overrides):
             yield chunk
 
     # ── Low-level create() / acreate() ───────────────────────────────────────
