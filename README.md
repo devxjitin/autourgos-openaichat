@@ -23,21 +23,13 @@ print(reply)
 ## Features
 
 - **One interface, any OpenAI-compatible provider**: OpenAI, Azure, Groq, Gemini, Mistral, DeepSeek, Ollama, and more, switched with just `base_url` + `model`
-- Sync and async generation, plus streaming for both
-- Native tool / function calling, sync and async
-- Structured output validated against a Pydantic model, or plain JSON mode
-- Multi-modal vision input: file paths, URLs, or raw bytes
-- Prompt templates with `{placeholder}` variables
-- Multi-turn conversations via a plain message list
-- Automatic retries with exponential back-off, plus a circuit breaker for cascading-failure protection
-- Automatic provider fallback chain: define backup providers and `invoke()` transparently switches to them if the primary fails, no proxy/gateway needed
-- Validated structured output: `invoke_structured()` returns a validated Pydantic instance directly, feeding validation errors back to the model and retrying on failure
-- Optional local call ledger: every call recorded to a SQLite file for audit/cost tracking — no external service, `sqlite3` is stdlib
-- Budget governor: set a hard USD cap and further calls are blocked once accumulated session cost reaches it
-- Optional PII/secret redaction: heuristic pre-flight scrubber masks (or blocks) emails, API keys, credit cards, SSNs, and phone numbers before they leave the process
-- Shadow-mode dual dispatch: compare the primary against backup providers concurrently, for observation only — invoke() always returns the primary's answer
+- Sync and async generation, plus streaming for both, multi-turn conversations, prompt templates, and multi-modal vision input
+- Structured output validated against a Pydantic model (with an automatic validation-retry loop), plain JSON mode, and native tool / function calling
+- Automatic retries with exponential back-off, a circuit breaker for cascading-failure protection, and an automatic provider fallback chain — no proxy/gateway needed
+- Built-in cost/latency tracking, plus a budget governor that hard-stops calls once a USD cap is reached
+- Optional local call ledger (SQLite, no external service) and shadow-mode dual dispatch for comparing providers concurrently
+- Optional PII/secret redaction: a heuristic pre-flight scrubber that masks (or blocks) emails, API keys, credit cards, SSNs, and phone numbers — with a bring-your-own-dictionary option and reversible restore-in-response
 - `extra_body=` passthrough for provider-specific request fields — e.g. vLLM's `guided_json`/`guided_regex` or llama.cpp's `grammar` for constrained decoding
-- Built-in cost and latency tracking
 - Fully typed (`py.typed`), sync/async context managers, low-level raw-response access
 
 ---
@@ -62,6 +54,7 @@ print(reply)
   - [vLLM](#vllm-self-hosted-high-throughput-serving)
   - [Switching providers at runtime](#switching-providers-at-runtime)
 - [Core Usage](#core-usage)
+  - **Basics**
   - [Text Generation](#text-generation)
   - [Async Generation](#async-generation)
   - [Streaming](#streaming)
@@ -69,21 +62,27 @@ print(reply)
   - [Batch Invocation](#batch-invocation)
   - [System Prompt](#system-prompt)
   - [Prompt Templates](#prompt-templates)
+  - [Multi-Turn Conversations](#multi-turn-conversations)
   - [Vision Input](#vision-input)
+  - **Structured & tool output**
   - [Structured Output](#structured-output)
   - [Validated Structured Output](#validated-structured-output)
   - [JSON Mode](#json-mode)
   - [Native Tool Calling](#native-tool-calling)
-  - [Multi-Turn Conversations](#multi-turn-conversations)
-  - [Cost Tracking](#cost-tracking)
-  - [Context Manager](#context-manager)
+  - **Reliability**
   - [Circuit Breaker](#circuit-breaker)
   - [Provider Fallback Chain](#provider-fallback-chain)
-  - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
+  - **Cost**
+  - [Cost Tracking](#cost-tracking)
   - [Budget Governor](#budget-governor)
-  - [PII / Secret Redaction](#pii--secret-redaction)
+  - **Observability**
+  - [Call Ledger (Audit Trail)](#call-ledger-audit-trail)
   - [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch)
+  - **Security**
+  - [PII / Secret Redaction](#pii--secret-redaction)
+  - **Advanced**
   - [Constrained Decoding / Provider-Specific Params](#constrained-decoding--provider-specific-params)
+  - [Context Manager](#context-manager)
   - [Low-Level Access](#low-level-access)
   - [Error Handling](#error-handling)
 - [Constructor Reference](#constructor-reference)
@@ -579,6 +578,26 @@ llm.invoke(prompt_variables={"language": "French"})
 # ValueError: Missing prompt template variables: text
 ```
 
+### Multi-Turn Conversations
+
+Pass a list of messages directly.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(model="gpt-4o")
+
+messages = [
+    {"role": "user",      "content": "My name is Jitin."},
+    {"role": "assistant", "content": "Nice to meet you, Jitin!"},
+    {"role": "user",      "content": "What is my name?"},
+]
+
+reply = llm.invoke(messages)
+print(reply)
+# Your name is Jitin.
+```
+
 ### Vision Input
 
 Pass image files, URLs, or raw bytes alongside text.
@@ -818,99 +837,6 @@ while True:
 # Final answer: The current weather in Paris is 22°C and Sunny.
 ```
 
-### Multi-Turn Conversations
-
-Pass a list of messages directly.
-
-```python
-from autourgos_openaichat import OpenAIChatModel
-
-llm = OpenAIChatModel(model="gpt-4o")
-
-messages = [
-    {"role": "user",      "content": "My name is Jitin."},
-    {"role": "assistant", "content": "Nice to meet you, Jitin!"},
-    {"role": "user",      "content": "What is my name?"},
-]
-
-reply = llm.invoke(messages)
-print(reply)
-# Your name is Jitin.
-```
-
-### Cost Tracking
-
-Pass pricing (USD per 1 million tokens) to get cost breakdowns.
-
-```python
-from autourgos_openaichat import OpenAIChatModel
-
-llm = OpenAIChatModel(
-    model="gpt-4o",
-    input_pricing=2.50,    # $2.50 per 1M input tokens
-    output_pricing=10.00,  # $10.00 per 1M output tokens
-    structured_output=True,
-)
-
-result = llm.invoke("Summarise the history of the internet in 3 sentences.")
-print(result["model"])          # gpt-4o
-print(result["response"])       # The internet began as ARPANET...
-print(result["input_tokens"])   # 18
-print(result["output_tokens"])  # 74
-print(result["total_tokens"])   # 92
-print(result["input_cost"])     # 0.000045
-print(result["output_cost"])    # 0.00074
-print(result["total_cost"])     # 0.000785
-print(result["latency_ms"])     # 1243.5
-```
-
-Access the last metadata without `structured_output=True`:
-
-```python
-llm = OpenAIChatModel(model="gpt-4o", input_pricing=2.50, output_pricing=10.00)
-reply = llm.invoke("Hello!")
-print(llm.last_metadata)
-# {
-#   "model": "gpt-4o",
-#   "response": "Hello! How can I help you today?",
-#   "input_tokens": 9,
-#   "output_tokens": 10,
-#   "total_tokens": 19,
-#   "input_cost": 0.0000225,
-#   "output_cost": 0.0001,
-#   "total_cost": 0.0001225,
-#   "latency_ms": 834.2
-# }
-```
-
-### Context Manager
-
-Automatically closes the HTTP client when done.
-
-```python
-from autourgos_openaichat import OpenAIChatModel
-
-with OpenAIChatModel(model="gpt-4o") as llm:
-    reply = llm.invoke("Ping!")
-    print(reply)
-    # Pong! How can I help you?
-# Client is closed here automatically
-```
-
-Async context manager:
-
-```python
-import asyncio
-from autourgos_openaichat import OpenAIChatModel
-
-async def main():
-    async with OpenAIChatModel(model="gpt-4o") as llm:
-        reply = await llm.ainvoke("Hello async!")
-        print(reply)
-
-asyncio.run(main())
-```
-
 ### Circuit Breaker
 
 Protects against cascading failures. After `circuit_failure_threshold` consecutive API errors, all calls are blocked for `circuit_cooldown_time` seconds.
@@ -988,6 +914,81 @@ except OpenAIChatModelAllProvidersFailedError as e:
 
 `create()`/`acreate()` (low-level raw access) are unaffected by `fallback_providers` — they always call the primary client only, since their contract is "the raw response of the client you configured."
 
+### Cost Tracking
+
+Pass pricing (USD per 1 million tokens) to get cost breakdowns.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    input_pricing=2.50,    # $2.50 per 1M input tokens
+    output_pricing=10.00,  # $10.00 per 1M output tokens
+    structured_output=True,
+)
+
+result = llm.invoke("Summarise the history of the internet in 3 sentences.")
+print(result["model"])          # gpt-4o
+print(result["response"])       # The internet began as ARPANET...
+print(result["input_tokens"])   # 18
+print(result["output_tokens"])  # 74
+print(result["total_tokens"])   # 92
+print(result["input_cost"])     # 0.000045
+print(result["output_cost"])    # 0.00074
+print(result["total_cost"])     # 0.000785
+print(result["latency_ms"])     # 1243.5
+```
+
+Access the last metadata without `structured_output=True`:
+
+```python
+llm = OpenAIChatModel(model="gpt-4o", input_pricing=2.50, output_pricing=10.00)
+reply = llm.invoke("Hello!")
+print(llm.last_metadata)
+# {
+#   "model": "gpt-4o",
+#   "response": "Hello! How can I help you today?",
+#   "input_tokens": 9,
+#   "output_tokens": 10,
+#   "total_tokens": 19,
+#   "input_cost": 0.0000225,
+#   "output_cost": 0.0001,
+#   "total_cost": 0.0001225,
+#   "latency_ms": 834.2
+# }
+```
+
+### Budget Governor
+
+Set `max_session_cost=` (USD) to hard-stop `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` once accumulated session cost reaches the cap — the blocked call is rejected **before** it reaches the API, so no further spend happens. Requires both `input_pricing` and `output_pricing` (cost can't be computed, and the cap can't trigger, without them).
+
+```python
+from autourgos_openaichat import OpenAIChatModel, BudgetExceededException
+
+llm = OpenAIChatModel(
+    model="gpt-4o",
+    input_pricing=2.50,
+    output_pricing=10.00,
+    max_session_cost=0.50,   # hard stop at $0.50 for this client's lifetime
+)
+
+try:
+    for prompt in many_prompts:
+        reply = llm.invoke(prompt)
+except BudgetExceededException as e:
+    print(f"Stopped: {e}")
+    print(f"Used ${llm.session_cost_used:.4f} of ${llm.max_session_cost:.4f}")
+```
+
+Call `llm.reset_session_budget()` to zero out `session_cost_used` and unblock a tripped cap (e.g. starting a new billing period without recreating the client).
+
+Notes:
+- **This is a backstop, not an exact per-call prediction.** A call's cost is only known after its response comes back, so the cap is checked against cost *already accumulated from prior calls* — the call that pushes you over the cap still completes; only the *next* one is blocked.
+- Hitting the cap does **not** count toward the circuit breaker's failure threshold — a budget stop is not a provider failure.
+- `invoke_structured()`/`ainvoke_structured()` check the budget once before the first attempt; a failed-validation retry attempt inside that call still costs money but its cost isn't tracked into `session_cost_used` today (only the final successful attempt's cost is recorded).
+- `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** budget-protected in this version — same gap as the [Call Ledger](#call-ledger-audit-trail), since no usage/cost metadata is computed on those paths.
+
 ### Call Ledger (Audit Trail)
 
 Set `ledger_path=` to record every `invoke()`, `ainvoke()`, `invoke_structured()`, and `ainvoke_structured()` call to a local SQLite file — model, provider used, prompt/response, tokens, cost, latency, validation retries. No external service, no extra dependency (`sqlite3` is part of the Python standard library). Disabled by default (`ledger_path=None`) — zero overhead unless you turn it on.
@@ -1031,35 +1032,54 @@ Notes:
 - `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** logged in this version — they don't compute usage/cost metadata today.
 - The ledger connection is closed automatically by the context manager (`with OpenAIChatModel(...) as llm:`).
 
-### Budget Governor
+### Shadow-Mode Dual Dispatch
 
-Set `max_session_cost=` (USD) to hard-stop `invoke()`/`ainvoke()`/`invoke_structured()`/`ainvoke_structured()` once accumulated session cost reaches the cap — the blocked call is rejected **before** it reaches the API, so no further spend happens. Requires both `input_pricing` and `output_pricing` (cost can't be computed, and the cap can't trigger, without them).
+Dispatch the same prompt to one or more "shadow" providers **concurrently** with the primary, purely for observation — `invoke()`/`ainvoke()` always return the **primary's** answer. Useful for catching regressions before switching a default model/provider, or for ongoing quality/cost comparison.
 
 ```python
-from autourgos_openaichat import OpenAIChatModel, BudgetExceededException
+from autourgos_openaichat import OpenAIChatModel
 
 llm = OpenAIChatModel(
-    model="gpt-4o",
-    input_pricing=2.50,
-    output_pricing=10.00,
-    max_session_cost=0.50,   # hard stop at $0.50 for this client's lifetime
+    model="gpt-4o",                          # primary — this is what invoke() returns
+    shadow_providers=[
+        {"model": "gpt-4o-mini"},             # compare against a cheaper model
+        {
+            "model": "llama3-70b-8192",       # and a different provider entirely
+            "api_key": "gsk_...",
+            "base_url": "https://api.groq.com/openai/v1",
+        },
+    ],
 )
 
-try:
-    for prompt in many_prompts:
-        reply = llm.invoke(prompt)
-except BudgetExceededException as e:
-    print(f"Stopped: {e}")
-    print(f"Used ${llm.session_cost_used:.4f} of ${llm.max_session_cost:.4f}")
+reply = llm.invoke("What is the capital of France?")
+print(reply)
+# Paris   (always from the primary — gpt-4o)
+
+for shadow in llm.last_shadow_results:
+    print(shadow)
+# {'provider_used': 'shadow[0]:gpt-4o-mini', 'response': 'Paris', 'similarity': 1.0,
+#  'input_tokens': 8, 'output_tokens': 1, 'total_cost': None, 'latency_ms': 210.4, 'error': None}
+# {'provider_used': 'shadow[1]:llama3-70b-8192', 'response': 'The capital of France is Paris.',
+#  'similarity': 0.42, 'input_tokens': 8, 'output_tokens': 7, 'total_cost': None,
+#  'latency_ms': 340.1, 'error': None}
 ```
 
-Call `llm.reset_session_budget()` to zero out `session_cost_used` and unblock a tripped cap (e.g. starting a new billing period without recreating the client).
+`similarity` is a 0.0-1.0 text-overlap ratio (stdlib `difflib`) against the primary's response — a rough signal, not semantic similarity. React to results live with `on_shadow_result=`:
+
+```python
+def alert_on_drift(shadow_result):
+    if shadow_result["similarity"] is not None and shadow_result["similarity"] < 0.5:
+        print(f"Drift detected from {shadow_result['provider_used']}!")
+
+llm = OpenAIChatModel(model="gpt-4o", shadow_providers=[...], on_shadow_result=alert_on_drift)
+```
 
 Notes:
-- **This is a backstop, not an exact per-call prediction.** A call's cost is only known after its response comes back, so the cap is checked against cost *already accumulated from prior calls* — the call that pushes you over the cap still completes; only the *next* one is blocked.
-- Hitting the cap does **not** count toward the circuit breaker's failure threshold — a budget stop is not a provider failure.
-- `invoke_structured()`/`ainvoke_structured()` check the budget once before the first attempt; a failed-validation retry attempt inside that call still costs money but its cost isn't tracked into `session_cost_used` today (only the final successful attempt's cost is recorded).
-- `invoke_with_tools()`/`ainvoke_with_tools()`/`stream()`/`astream()` are **not** budget-protected in this version — same gap as the [Call Ledger](#call-ledger-audit-trail), since no usage/cost metadata is computed on those paths.
+- **Adds latency**: primary and shadow providers run concurrently (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`), so total call time is roughly `max(primary_latency, slowest_shadow_latency)` — not the sum, but not zero overhead either. `invoke()` waits for every shadow provider to finish (or fail) before returning.
+- **Costs real money**: each shadow provider gets one live API call per invocation. This cost is tracked in each shadow result's `total_cost` but is **not** added to `session_cost_used` / counted against `max_session_cost`.
+- Each shadow provider gets a single attempt — no retries. A shadow failure never raises and never affects the primary's result; it just shows up with `error` set in `last_shadow_results`.
+- Only `invoke()`/`ainvoke()` dispatch shadows in this version — `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()` don't.
+- If [Call Ledger](#call-ledger-audit-trail) is enabled, every shadow result is also recorded in a separate `shadow_calls` table.
 
 ### PII / Secret Redaction
 
@@ -1184,55 +1204,6 @@ Notes:
 - The [Call Ledger](#call-ledger-audit-trail) always records the masked text, regardless of this setting — restoration only affects what's returned to your code, never what's persisted.
 - Placeholders become unique per occurrence (`[REDACTED:email:1]`, `[REDACTED:email:2]`, ...) only when this is enabled, so each one restores to the correct original value; with it off, placeholders stay `[REDACTED:email]` as shown above.
 
-### Shadow-Mode Dual Dispatch
-
-Dispatch the same prompt to one or more "shadow" providers **concurrently** with the primary, purely for observation — `invoke()`/`ainvoke()` always return the **primary's** answer. Useful for catching regressions before switching a default model/provider, or for ongoing quality/cost comparison.
-
-```python
-from autourgos_openaichat import OpenAIChatModel
-
-llm = OpenAIChatModel(
-    model="gpt-4o",                          # primary — this is what invoke() returns
-    shadow_providers=[
-        {"model": "gpt-4o-mini"},             # compare against a cheaper model
-        {
-            "model": "llama3-70b-8192",       # and a different provider entirely
-            "api_key": "gsk_...",
-            "base_url": "https://api.groq.com/openai/v1",
-        },
-    ],
-)
-
-reply = llm.invoke("What is the capital of France?")
-print(reply)
-# Paris   (always from the primary — gpt-4o)
-
-for shadow in llm.last_shadow_results:
-    print(shadow)
-# {'provider_used': 'shadow[0]:gpt-4o-mini', 'response': 'Paris', 'similarity': 1.0,
-#  'input_tokens': 8, 'output_tokens': 1, 'total_cost': None, 'latency_ms': 210.4, 'error': None}
-# {'provider_used': 'shadow[1]:llama3-70b-8192', 'response': 'The capital of France is Paris.',
-#  'similarity': 0.42, 'input_tokens': 8, 'output_tokens': 7, 'total_cost': None,
-#  'latency_ms': 340.1, 'error': None}
-```
-
-`similarity` is a 0.0-1.0 text-overlap ratio (stdlib `difflib`) against the primary's response — a rough signal, not semantic similarity. React to results live with `on_shadow_result=`:
-
-```python
-def alert_on_drift(shadow_result):
-    if shadow_result["similarity"] is not None and shadow_result["similarity"] < 0.5:
-        print(f"Drift detected from {shadow_result['provider_used']}!")
-
-llm = OpenAIChatModel(model="gpt-4o", shadow_providers=[...], on_shadow_result=alert_on_drift)
-```
-
-Notes:
-- **Adds latency**: primary and shadow providers run concurrently (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`), so total call time is roughly `max(primary_latency, slowest_shadow_latency)` — not the sum, but not zero overhead either. `invoke()` waits for every shadow provider to finish (or fail) before returning.
-- **Costs real money**: each shadow provider gets one live API call per invocation. This cost is tracked in each shadow result's `total_cost` but is **not** added to `session_cost_used` / counted against `max_session_cost`.
-- Each shadow provider gets a single attempt — no retries. A shadow failure never raises and never affects the primary's result; it just shows up with `error` set in `last_shadow_results`.
-- Only `invoke()`/`ainvoke()` dispatch shadows in this version — `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()` don't.
-- If [Call Ledger](#call-ledger-audit-trail) is enabled, every shadow result is also recorded in a separate `shadow_calls` table.
-
 ### Constrained Decoding / Provider-Specific Params
 
 Self-hosted OpenAI-compatible servers (vLLM, llama.cpp, and others) support extra, non-standard request fields for constrained/guided generation — forcing output to match a JSON schema, a regex, a fixed set of choices, or a formal grammar. These aren't part of the OpenAI API, so the `openai` SDK exposes them via `extra_body=`. Set `extra_body=` on the constructor to merge your own fields into **every** request this client makes (primary, fallback, and shadow providers alike).
@@ -1273,6 +1244,34 @@ Notes:
 - **Not portable**: these fields are provider-specific. A provider that doesn't recognize a key will typically ignore it or reject the request — check your provider's docs. Mixing an `extra_body`-dependent client with [fallback providers](#provider-fallback-chain) on a different backend can silently break the guided behavior on the fallback (the same `extra_body` is sent to all of them).
 - This is a single, constructor-level setting — no per-call override in this version. It composes automatically with the [Provider Fallback Chain](#provider-fallback-chain) and [Shadow-Mode Dual Dispatch](#shadow-mode-dual-dispatch), since every target reuses the same base request params.
 - `output_schema=` (this library's own structured-output feature) and `extra_body={"guided_json": ...}` solve a similar problem differently: `output_schema` uses the *standard* OpenAI `response_format` (works on OpenAI, Azure, and any provider that implements strict JSON-schema mode), while `guided_json` is vLLM's own mechanism for providers that don't. Use whichever your provider actually supports — you generally don't need both at once.
+
+### Context Manager
+
+Automatically closes the HTTP client when done.
+
+```python
+from autourgos_openaichat import OpenAIChatModel
+
+with OpenAIChatModel(model="gpt-4o") as llm:
+    reply = llm.invoke("Ping!")
+    print(reply)
+    # Pong! How can I help you?
+# Client is closed here automatically
+```
+
+Async context manager:
+
+```python
+import asyncio
+from autourgos_openaichat import OpenAIChatModel
+
+async def main():
+    async with OpenAIChatModel(model="gpt-4o") as llm:
+        reply = await llm.ainvoke("Hello async!")
+        print(reply)
+
+asyncio.run(main())
+```
 
 ### Low-Level Access
 
