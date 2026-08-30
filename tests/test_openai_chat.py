@@ -107,7 +107,7 @@ def test_invoke_passes_sampling_params():
 
 
 def test_invoke_accepts_per_call_overrides():
-    # Mirrors autourgos-react-agent's AgentLoopMixin, which calls
+    # Mirrors autourgos-agent's AgentLoopMixin, which calls
     # self.llm.invoke(messages, **call_kwargs) with per-iteration overrides
     # (e.g. from an on_before_iteration middleware hook).
     llm = make_llm(temperature=0.7)
