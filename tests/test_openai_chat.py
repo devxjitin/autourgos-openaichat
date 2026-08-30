@@ -387,6 +387,15 @@ def test_invoke_with_tools_returns_tool_calls():
     assert kwargs["tool_choice"] == "auto"
 
 
+def test_invoke_with_tools_accepts_per_call_overrides():
+    llm = make_llm(temperature=0.7)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke_with_tools("hi", TOOLS, temperature=0.1, stop=["Observation:"])
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.1  # per-call override wins over constructor default
+    assert kwargs["stop"] == ["Observation:"]
+
+
 def test_invoke_with_tools_returns_final_answer_when_no_tool_calls():
     llm = make_llm()
     llm._client.chat.completions.create.return_value = make_completion("It's sunny.")
@@ -415,6 +424,19 @@ def test_ainvoke_with_tools():
 
     resp = asyncio.run(run())
     assert resp.tool_calls[0].arguments == {"city": "London"}
+
+
+def test_ainvoke_with_tools_accepts_per_call_overrides():
+    llm = make_llm()
+    llm._async_client.chat.completions.create.return_value = make_completion("ok")
+
+    async def run():
+        return await llm.ainvoke_with_tools("hi", TOOLS, temperature=0.2, max_tokens=64)
+
+    asyncio.run(run())
+    kwargs = llm._async_client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.2
+    assert kwargs["max_tokens"] == 64
 
 
 # ── 12. Multi-turn conversations ─────────────────────────────────────────────

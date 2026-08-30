@@ -1425,7 +1425,10 @@ class OpenAIChatModel(BaseLLM):
         Args:
             prompt: User message string or messages list.
             tools: List of tool dicts with keys name/description/parameters.
-            **kwargs: Optional overrides such as tool_choice, files, image_detail.
+            **kwargs: tool_choice, files, image_detail, plus any other
+                per-call request param override (e.g. temperature=, stop=) —
+                merged over the constructor's defaults for this call only,
+                the same as invoke()'s **overrides.
 
         Returns:
             ToolCallResponse with tool_calls (if the model called tools)
@@ -1433,12 +1436,13 @@ class OpenAIChatModel(BaseLLM):
         """
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
+        tool_choice = kwargs.pop("tool_choice", "auto")
         messages = self._build_messages(prompt, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
-        params = self._build_base_params(messages=messages, stream=False)
+        params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)
         if openai_tools:
             params["tools"] = openai_tools
-            params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            params["tool_choice"] = tool_choice
         raw, _provider_label = self._create_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
@@ -1455,12 +1459,13 @@ class OpenAIChatModel(BaseLLM):
         """Async version of invoke_with_tools()."""
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
+        tool_choice = kwargs.pop("tool_choice", "auto")
         messages = self._build_messages(prompt, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
-        params = self._build_base_params(messages=messages, stream=False)
+        params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)
         if openai_tools:
             params["tools"] = openai_tools
-            params["tool_choice"] = kwargs.get("tool_choice", "auto")
+            params["tool_choice"] = tool_choice
         raw, _provider_label = await self._acreate_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
