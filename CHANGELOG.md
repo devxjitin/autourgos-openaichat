@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.4.0] - 2026-09-01
+
+- Added: `FunctionCall.arguments_parse_error: Optional[str] = None`. When a
+  tool call's JSON `arguments` fail to parse, this is now set to the parse
+  error (and a warning is logged) instead of silently falling back to `{}`
+  with no way to tell a genuinely empty-args call apart from a failed
+  parse.
+- Added: the schema-normalization helper previously private as
+  `_enforce_additional_properties_false` is now public as
+  `enforce_additional_properties_false`, exported from the package root.
+  The old private name is kept as a backward-compat alias.
+- Changed: `extract_text_from_response`'s last-resort fallback key-scan and
+  `_encode_file`'s local-path-read-failure-to-URL fallback now log a
+  warning when triggered, instead of being fully silent.
+
 ## [2.3.1] - 2026-08-30
 
 - Fixed: `invoke_with_tools()`/`ainvoke_with_tools()` now also accept `**overrides` (e.g. `temperature=`, `top_p=`, `max_tokens=`, `stop=`) merged over the constructor's defaults for that call only — the same fix 2.3.0 gave `invoke`/`ainvoke`/`stream`/`astream`, extended to the tool-calling methods, which previously dropped any keyword besides `tool_choice`/`files`/`image_detail` silently (no error — the override just had no effect on the request). Found while adding `autourgos-react-agent`'s `tool_calling_mode="native"`, where an `on_before_iteration` middleware hook's returned overrides reached `invoke_with_tools()` but never affected the actual API call.
