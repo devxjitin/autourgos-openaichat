@@ -793,6 +793,14 @@ response = await llm.ainvoke_with_tools(
 )
 ```
 
+If the model's tool-call arguments come back as malformed JSON, `call.arguments` falls back to `{}` and `call.arguments_parse_error` is set to a description of what went wrong — check it if a tool call ever seems to be missing arguments it should have had:
+
+```python
+for call in response.tool_calls:
+    if call.arguments_parse_error:
+        print(f"Warning: {call.name}'s arguments failed to parse: {call.arguments_parse_error}")
+```
+
 Full agentic loop example:
 
 ```python
@@ -1438,8 +1446,9 @@ llm = OpenAIChatModel(
 | Field | Type | Description |
 |---|---|---|
 | `.name` | `str` | Tool function name |
-| `.arguments` | `dict` | Parsed JSON arguments |
+| `.arguments` | `dict` | Parsed JSON arguments (`{}` if parsing failed — see `.arguments_parse_error`) |
 | `.call_id` | `str \| None` | Call ID for multi-turn tracking |
+| `.arguments_parse_error` | `str \| None` | Set to the parse error message when the model's JSON arguments failed to parse; `None` on success |
 
 ### Metadata dict (when `structured_output=True`, or via `llm.last_metadata`)
 
