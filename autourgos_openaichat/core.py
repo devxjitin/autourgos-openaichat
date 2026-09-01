@@ -149,8 +149,18 @@ def _encode_file(file: Any) -> Optional[Dict[str, Any]]:
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{data}"},
             }
-        except (OSError, IOError):
-            # Treat as a direct URL
+        except (OSError, IOError) as exc:
+            # Treat as a direct URL. Only silent when the string actually
+            # looks like one -- a typo'd local path (e.g. "photo.jpg" that
+            # doesn't exist) doesn't start with a URL scheme, and used to
+            # silently become a bogus "URL" sent straight to the API
+            # instead of a clear file-not-found error surfacing here.
+            if not file.startswith(("http://", "https://", "data:")):
+                logger.warning(
+                    "_encode_file: %r could not be opened as a file (%s) and doesn't "
+                    "look like a URL; sending it to the API as-is anyway.",
+                    file, exc,
+                )
             return {"type": "image_url", "image_url": {"url": file}}
     if isinstance(file, dict):
         if "data" in file:
@@ -193,7 +203,7 @@ def build_multimodal_messages(
 
 # ── Response format builder ───────────────────────────────────────────────────
 
-def _enforce_additional_properties_false(schema: Any) -> Any:
+def enforce_additional_properties_false(schema: Any) -> Any:
     """
     Recursively set ``additionalProperties: False`` on every object node.
 
@@ -213,17 +223,26 @@ def _enforce_additional_properties_false(schema: Any) -> Any:
             sub = schema.get(key)
             if isinstance(sub, dict):
                 for value in sub.values():
-                    _enforce_additional_properties_false(value)
+                    enforce_additional_properties_false(value)
         for key in ("items", "additionalProperties"):
             sub = schema.get(key)
             if isinstance(sub, dict):
-                _enforce_additional_properties_false(sub)
+                enforce_additional_properties_false(sub)
         for key in ("anyOf", "allOf", "oneOf"):
             sub = schema.get(key)
             if isinstance(sub, list):
                 for value in sub:
-                    _enforce_additional_properties_false(value)
+                    enforce_additional_properties_false(value)
     return schema
+
+
+# Backward-compat alias for the old private name. autourgos-responses (and
+# potentially other sibling packages) used to import this directly from
+# `autourgos_openaichat.core` rather than through the public `__init__.py`
+# surface -- keep the old name importable so that isn't a breaking change,
+# but new/sibling-package code should use the public
+# `from autourgos_openaichat import enforce_additional_properties_false`.
+_enforce_additional_properties_false = enforce_additional_properties_false
 
 
 def build_response_format(
@@ -245,7 +264,7 @@ def build_response_format(
                 "type": "json_schema",
                 "json_schema": {
                     "name": getattr(output_schema, "__name__", "response"),
-                    "schema": _enforce_additional_properties_false(schema_fn()),
+                    "schema": enforce_additional_properties_false(schema_fn()),
                     "strict": True,
                 },
             }
@@ -255,7 +274,7 @@ def build_response_format(
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "schema": _enforce_additional_properties_false(dict(output_schema)),
+                    "schema": enforce_additional_properties_false(dict(output_schema)),
                     "strict": True,
                 },
             }

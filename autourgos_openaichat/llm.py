@@ -31,6 +31,12 @@ class FunctionCall:
     name: str
     arguments: Dict[str, Any]
     call_id: Optional[str] = None
+    # Set when the model returned malformed JSON for `arguments` -- `arguments`
+    # still falls back to {} in that case (so existing callers keep working
+    # without a null-check), but callers that care can check this field
+    # instead of silently getting a tool call with wrong/missing arguments
+    # and no signal anything went wrong.
+    arguments_parse_error: Optional[str] = None
 
 
 @dataclass

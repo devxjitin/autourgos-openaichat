@@ -1417,14 +1417,21 @@ class OpenAIChatModel(BaseLLM):
             return calls
         tc_list = getattr(choices[0].message, "tool_calls", None) or []
         for tc in tc_list:
+            parse_error: Optional[str] = None
             try:
                 arguments = json.loads(tc.function.arguments or "{}")
-            except (json.JSONDecodeError, AttributeError):
+            except (json.JSONDecodeError, AttributeError) as exc:
                 arguments = {}
+                parse_error = str(exc)
+                logger.warning(
+                    "Malformed tool-call arguments for %r; treating as {}: %s",
+                    getattr(tc.function, "name", "<unknown>"), exc,
+                )
             calls.append(FunctionCall(
                 name=tc.function.name,
                 arguments=arguments,
                 call_id=getattr(tc, "id", None),
+                arguments_parse_error=parse_error,
             ))
         return calls
 

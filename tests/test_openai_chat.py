@@ -412,6 +412,19 @@ def test_invoke_with_tools_malformed_arguments_json_falls_back_to_empty_dict():
     llm._client.chat.completions.create.return_value = make_completion(text=None, tool_calls=[tc])
     resp = llm.invoke_with_tools("Weather?", TOOLS)
     assert resp.tool_calls[0].arguments == {}
+    # the fallback-to-{} used to be silent -- callers had no way to tell a
+    # tool call with genuinely no arguments apart from one whose JSON failed
+    # to parse. arguments_parse_error now surfaces that distinction.
+    assert resp.tool_calls[0].arguments_parse_error is not None
+
+
+def test_invoke_with_tools_valid_arguments_json_has_no_parse_error():
+    llm = make_llm()
+    raw = make_completion(text=None, tool_calls=[make_tool_call("get_weather", {"city": "Tokyo"})])
+    llm._client.chat.completions.create.return_value = raw
+    resp = llm.invoke_with_tools("Weather?", TOOLS)
+    assert resp.tool_calls[0].arguments == {"city": "Tokyo"}
+    assert resp.tool_calls[0].arguments_parse_error is None
 
 
 def test_ainvoke_with_tools():
@@ -778,6 +791,29 @@ def test_multimodal_path_read_failure_falls_back_to_url_treatment():
     llm.invoke("desc", files=["not-a-real-path-on-disk.jpg"])
     messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
     assert messages[0]["content"][1]["image_url"]["url"] == "not-a-real-path-on-disk.jpg"
+
+
+def test_multimodal_path_read_failure_for_non_url_string_logs_a_warning(caplog):
+    """A typo'd local path used to silently become a bogus 'URL' sent to the
+    API with no signal anything was wrong. Behavior (still sending it) is
+    unchanged, but it must now be diagnosable via a warning log."""
+    import logging
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    with caplog.at_level(logging.WARNING, logger="autourgos_openaichat"):
+        llm.invoke("desc", files=["not-a-real-path-on-disk.jpg"])
+    assert any("not-a-real-path-on-disk.jpg" in r.message for r in caplog.records)
+
+
+def test_multimodal_real_url_string_read_failure_does_not_warn(caplog):
+    """A genuine http(s)/data URL failing to open() as a file is expected --
+    no warning needed since this is exactly the documented URL path."""
+    import logging
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    with caplog.at_level(logging.WARNING, logger="autourgos_openaichat"):
+        llm.invoke("desc", files=["https://example.com/chart.png"])
+    assert not any("could not be opened" in r.message for r in caplog.records)
 
 
 # ── 18. Provider fallback chain ─────────────────────────────────────────────
@@ -1570,3 +1606,33 @@ def test_extra_body_propagates_to_fallback_provider():
     llm.invoke("hi")
     fb_kwargs = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs
     assert fb_kwargs["extra_body"] == guided
+
+
+# ── extract_text_from_response fallback key-scan ─────────────────────────────
+
+def test_extract_text_from_response_fallback_key_scan_logs_a_warning(caplog):
+    """The fallback key-scan (used only when choices/output/output_text all
+    miss) used to silently return a top-level 'text'/'delta'/'content' field
+    with no signal the response didn't match a known shape. It must now log
+    a warning when this path is taken."""
+    import logging
+    from autourgos_openaichat.model_runtime import extract_text_from_response
+
+    with caplog.at_level(logging.WARNING, logger="autourgos_openaichat"):
+        result = extract_text_from_response({"text": "fallback text"})
+
+    assert result == "fallback text"
+    assert any("falling back" in r.message.lower() for r in caplog.records)
+
+
+def test_extract_text_from_response_known_shape_does_not_warn(caplog):
+    import logging
+    from autourgos_openaichat.model_runtime import extract_text_from_response
+
+    with caplog.at_level(logging.WARNING, logger="autourgos_openaichat"):
+        result = extract_text_from_response(
+            {"choices": [{"message": {"content": "hello"}}]}
+        )
+
+    assert result == "hello"
+    assert not any("falling back" in r.message for r in caplog.records)

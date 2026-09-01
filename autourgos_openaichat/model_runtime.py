@@ -6,12 +6,15 @@ Self-contained: no autourgos-core dependency.
 
 from __future__ import annotations
 
+import logging
 import os
 import warnings
 from contextlib import contextmanager
 from string import Formatter
 from typing import Any, Dict, Iterator, Optional
 import time
+
+logger = logging.getLogger(__name__)
 
 
 # ── Latency tracking ──────────────────────────────────────────────────────────
@@ -139,11 +142,22 @@ def extract_text_from_response(resp: Any) -> Optional[str]:
     if isinstance(output_text, str) and output_text.strip():
         return output_text
 
-    # Fallback key scan
+    # Fallback key scan -- last resort for a response shape none of the
+    # known formats above matched. Logged (not silent) because a top-level
+    # dict that happens to carry an unrelated string field named exactly
+    # "text"/"delta"/"content" would otherwise have that field returned as
+    # if it were the actual completion text, with no signal anything was
+    # unusual about the response shape.
     if isinstance(resp, dict):
         for key in ("text", "delta", "content"):
             val = resp.get(key)
             if isinstance(val, str) and val.strip():
+                logger.warning(
+                    "extract_text_from_response: response matched none of the known "
+                    "shapes (choices/output/output_text); falling back to top-level "
+                    "%r key. This may not be the actual completion text.",
+                    key,
+                )
                 return val
 
     return None

@@ -41,6 +41,7 @@ from .llm import (
     FunctionCall,
     ToolCallResponse,
 )
+from .core import enforce_additional_properties_false
 from .model_runtime import (
     build_structured_output,
     configure_runtime_environment,
@@ -79,4 +80,5 @@ __all__ = [
     "build_structured_output",
     "extract_text_from_response",
     "configure_runtime_environment",
+    "enforce_additional_properties_false",
 ]
