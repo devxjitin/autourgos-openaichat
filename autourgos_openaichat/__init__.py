@@ -39,6 +39,7 @@ from .llm import (
     BudgetExceededException,
     CircuitBreakerOpenException,
     FunctionCall,
+    NonTransientError,
     ToolCallResponse,
 )
 from .core import enforce_additional_properties_false
@@ -74,6 +75,7 @@ __all__ = [
     "ToolCallResponse",
     "CircuitBreakerOpenException",
     "BudgetExceededException",
+    "NonTransientError",
     # Runtime helpers
     "track_latency",
     "extract_usage_metadata",

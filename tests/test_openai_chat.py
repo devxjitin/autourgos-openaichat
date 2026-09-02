@@ -20,6 +20,7 @@ from autourgos_openaichat import (
     OpenAIChatModelAPIError,
     OpenAIChatModelConfigError,
     OpenAIChatModelImportError,
+    OpenAIChatModelRedactionBlockedError,
     OpenAIChatModelResponseError,
     CircuitBreakerOpenException,
 )
@@ -552,6 +553,37 @@ def test_circuit_breaker_ignores_value_errors_as_non_transient():
     with pytest.raises(ValueError):
         llm.invoke()  # no prompt, no template configured -> ValueError, raised before any API call
     assert llm._consecutive_failures == 0
+
+
+def test_circuit_breaker_ignores_config_errors_as_non_transient():
+    """
+    Regression: a caller/config mistake (e.g. invoke_structured() with a
+    non-Pydantic output_schema) must not trip the circuit breaker -- it's not
+    a sign the provider is unhealthy, and previously counted as a failure,
+    letting repeated config mistakes block unrelated, healthy invoke() calls
+    on the same instance.
+    """
+    llm = make_llm(circuit_failure_threshold=1)
+    with pytest.raises(OpenAIChatModelConfigError):
+        llm.invoke_structured("give me a number")  # output_schema=None -> ConfigError
+    assert llm._consecutive_failures == 0
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"  # not blocked by a tripped circuit
+
+
+def test_circuit_breaker_ignores_redaction_blocked_as_non_transient():
+    """
+    Regression: redact_mode="block" correctly refusing a PII-matching prompt
+    is the redaction policy working as designed, not a provider failure --
+    previously counted toward the circuit breaker, so a burst of legitimately
+    blocked prompts could trip it and block unrelated, clean calls too.
+    """
+    llm = make_llm(redact_pii=True, redact_mode="block", circuit_failure_threshold=1)
+    with pytest.raises(OpenAIChatModelRedactionBlockedError):
+        llm.invoke("my email is bob@example.com")
+    assert llm._consecutive_failures == 0
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    assert llm.invoke("hi") == "ok"  # not blocked by a tripped circuit
 
 
 # ── 16. Error handling ───────────────────────────────────────────────────────

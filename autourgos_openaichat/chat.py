@@ -14,7 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
 from .ledger import close_ledger, open_ledger, write_ledger_entry, write_shadow_ledger_entry
-from .llm import BaseLLM, FunctionCall, ToolCallResponse
+from .llm import BaseLLM, FunctionCall, NonTransientError, ToolCallResponse
 from .redaction import compile_patterns, redact_value, restore_text
 from .shadow import compute_similarity
 from .model_runtime import (
@@ -71,8 +71,14 @@ class OpenAIChatModelResponseError(OpenAIChatModelError):
     """Raised when the API response cannot be interpreted."""
 
 
-class OpenAIChatModelConfigError(OpenAIChatModelError):
-    """Raised for incompatible configuration options."""
+class OpenAIChatModelConfigError(OpenAIChatModelError, NonTransientError):
+    """
+    Raised for incompatible configuration options.
+
+    A caller/config mistake, not a sign the provider is unhealthy -- mixes in
+    NonTransientError so it never counts toward the circuit breaker's
+    consecutive-failure threshold (see NonTransientError's docstring).
+    """
 
 
 class OpenAIChatModelValidationError(OpenAIChatModelResponseError):
@@ -92,11 +98,18 @@ class OpenAIChatModelValidationError(OpenAIChatModelResponseError):
         self.validation_error = validation_error
 
 
-class OpenAIChatModelRedactionBlockedError(OpenAIChatModelError):
+class OpenAIChatModelRedactionBlockedError(OpenAIChatModelError, NonTransientError):
     """
     Raised when ``redact_mode="block"`` and the resolved prompt matched one or
     more redaction patterns. ``.categories_found`` lists which categories
     (e.g. "email", "api_key") triggered the block.
+
+    This is the redaction policy working as designed, not a provider failure
+    -- mixes in NonTransientError so it never counts toward the circuit
+    breaker's consecutive-failure threshold (see NonTransientError's
+    docstring). Without this, a burst of legitimately-blocked prompts would
+    trip the breaker and block every other call on the same instance,
+    including clean ones.
     """
 
     def __init__(self, message: str, *, categories_found: List[str]) -> None:

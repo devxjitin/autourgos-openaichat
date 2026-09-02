@@ -25,6 +25,27 @@ class BudgetExceededException(Exception):
     """Raised when a call is blocked because max_session_cost has already been reached."""
 
 
+class NonTransientError(Exception):
+    """
+    Marker mixin for exceptions that must never count toward the circuit
+    breaker's consecutive-failure threshold.
+
+    The circuit breaker exists to detect a genuinely unhealthy provider and
+    fail fast instead of hammering it. A caller/config mistake (e.g. an
+    invalid ``output_schema``) or a by-design policy block (e.g.
+    ``redact_mode="block"`` correctly refusing to send a prompt that matched
+    a redaction pattern) is neither -- the provider may be perfectly healthy.
+    Without this, five such mistakes/blocks in a row trip the breaker and
+    block every *other* call on the same instance (including unrelated,
+    healthy ones) for ``circuit_cooldown_time`` seconds.
+
+    Subclasses in concrete wrappers (e.g. ``OpenAIChatModelConfigError``,
+    ``OpenAIChatModelRedactionBlockedError``) mix this in alongside their
+    normal exception base so existing ``except OpenAIChatModelConfigError``
+    callers are unaffected.
+    """
+
+
 @dataclass
 class FunctionCall:
     """A single tool call requested by the LLM."""
@@ -164,6 +185,7 @@ class BaseLLM(ABC):
                 if not isinstance(exc, (
                     TypeError, ValueError, KeyError, AttributeError,
                     NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
+                    NonTransientError,
                 )):
                     with self._circuit_lock:
                         self._consecutive_failures += 1
@@ -216,6 +238,7 @@ class BaseLLM(ABC):
                 if not isinstance(exc, (
                     TypeError, ValueError, KeyError, AttributeError,
                     NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
+                    NonTransientError,
                 )):
                     async with self._async_circuit_lock:
                         self._consecutive_failures += 1
@@ -268,4 +291,5 @@ __all__ = [
     "ToolCallResponse",
     "CircuitBreakerOpenException",
     "BudgetExceededException",
+    "NonTransientError",
 ]
