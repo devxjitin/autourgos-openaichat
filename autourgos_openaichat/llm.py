@@ -11,6 +11,7 @@ import functools
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
@@ -115,8 +116,28 @@ class BaseLLM(ABC):
         self.max_session_cost = max_session_cost
         self.session_cost_used: float = 0.0
         self._budget_lock = threading.Lock()
+        self._budget_admission_lock = threading.Lock()
+        self._async_budget_admission_lock: Optional[asyncio.Lock] = None
 
     # ── Budget governor ───────────────────────────────────────────────────────
+    # A call's cost is only known after its response, so the *check* and the
+    # *record* can't be one atomic operation the way a simple counter could
+    # be. Without admission control, N concurrent calls sharing one capped
+    # instance (e.g. via abatch_invoke()) can all pass _check_budget() before
+    # any of them records its cost, overshooting the cap by up to N-1 calls'
+    # worth. _budget_admission()/_async_budget_admission() close that window
+    # by holding an admission lock from the (re-)check through to whichever
+    # comes first for that call: the caller recording its cost, or raising.
+    # Only one call can be inside the admission section at a time *within its
+    # own concurrency domain* (sync calls serialize against other sync calls
+    # via a threading.Lock; async calls serialize against other async calls
+    # via an asyncio.Lock) -- consistent with this class's circuit-breaker
+    # locking, mixing sync invoke() and async ainvoke() calls concurrently on
+    # the same instance is not itself serialized against the other domain.
+    # This trades away concurrency for calls sharing a capped instance in
+    # exchange for the cap actually holding under concurrent load; an
+    # uncapped instance (max_session_cost=None) pays no serialization cost,
+    # since _check_budget() is a no-op and the lock is uncontended.
 
     def _check_budget(self) -> None:
         if self.max_session_cost is not None and self.session_cost_used >= self.max_session_cost:
@@ -130,6 +151,31 @@ class BaseLLM(ABC):
             return
         with self._budget_lock:
             self.session_cost_used += cost
+
+    @contextmanager
+    def _budget_admission(self) -> Iterator[None]:
+        """
+        Sync admission section: acquire the sync admission lock, re-check the
+        budget (authoritative -- closes the race an earlier optimistic
+        `_check_budget()` call can't), then hold the lock for the caller's
+        entire critical section (the real API call plus `_record_session_cost()`)
+        so no other sync call on this instance can be admitted until this one
+        finishes or raises.
+        """
+        with self._budget_admission_lock:
+            self._check_budget()
+            yield
+
+    @asynccontextmanager
+    async def _async_budget_admission(self) -> AsyncIterator[None]:
+        """Async counterpart of `_budget_admission()`. See its docstring."""
+        if self._async_budget_admission_lock is None:
+            with _lazy_init_lock:
+                if self._async_budget_admission_lock is None:
+                    self._async_budget_admission_lock = asyncio.Lock()
+        async with self._async_budget_admission_lock:
+            self._check_budget()
+            yield
 
     def reset_session_budget(self) -> None:
         """Reset accumulated session cost back to 0, unblocking a tripped budget cap."""

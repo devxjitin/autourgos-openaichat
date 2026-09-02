@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, AsyncMock, patch
 
@@ -1192,6 +1194,46 @@ def test_budget_governor_blocks_once_cap_reached():
     with pytest.raises(BudgetExceededException):
         llm.invoke("hi again")
     assert llm._client.chat.completions.create.call_count == 1  # 2nd call never reached the API
+
+
+def test_budget_admission_serializes_concurrent_invocations():
+    """
+    Regression: concurrent invoke() calls sharing a capped instance must not
+    all pass the budget check before any of them records cost. Without
+    admission control, N threads racing a cap that a single call's cost
+    alone exceeds could all slip through before the first one's cost is
+    recorded. With admission control serializing them, only the first one
+    admitted succeeds -- every other thread must observe the now-exceeded
+    budget and raise.
+    """
+    llm = make_llm(input_pricing=1_000_000.0, output_pricing=1_000_000.0, max_session_cost=1.0)
+
+    def slow_create(*args, **kwargs):
+        time.sleep(0.05)  # simulate real API latency, widening the race window
+        return make_completion("ok")  # usage (9, 10, 19) -> cost $19, well over the $1 cap
+
+    llm._client.chat.completions.create.side_effect = slow_create
+
+    results: List[str] = []
+    results_lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            llm.invoke("hi")
+            outcome = "ok"
+        except BudgetExceededException:
+            outcome = "blocked"
+        with results_lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=worker) for _ in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results.count("ok") == 1
+    assert results.count("blocked") == 4
 
 
 def test_reset_session_budget_unblocks():

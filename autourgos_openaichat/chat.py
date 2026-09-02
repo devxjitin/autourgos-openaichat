@@ -258,7 +258,14 @@ class OpenAIChatModel(BaseLLM):
                 computed and the cap would never trigger). Call reset_session_budget() to
                 unblock. This is a backstop, not an exact per-call prediction — a call's
                 cost is only known after its response, so the cap is checked against
-                already-accumulated cost, not the upcoming call.
+                already-accumulated cost, not the upcoming call. Concurrent calls sharing
+                a capped instance (e.g. via abatch_invoke()) are admitted one at a time —
+                a call's budget check, its API call, and recording its cost all happen
+                before the next concurrent call's check is allowed to proceed — so the cap
+                actually holds instead of being overshoot-able by N concurrent calls each
+                passing the check before any of them records cost. This trades away
+                concurrency for calls sharing a capped instance; an uncapped instance
+                (max_session_cost=None, the default) pays no serialization cost.
             redact_pii: If True, the resolved prompt (string or messages list) is scanned
                 for likely secrets/PII before it is sent. A heuristic, best-effort scrubber
                 — not a compliance-grade DLP solution. Default False (no scanning).
@@ -1145,29 +1152,33 @@ class OpenAIChatModel(BaseLLM):
         if self.streaming:
             return "".join(self._invoke_stream_mode(messages=messages, overrides=overrides))
 
-        with track_latency() as timing:
-            response_text, raw_response, provider_label, provider_model, provider_pricing = self._invoke_non_stream(
-                messages=messages, overrides=overrides
+        with self._budget_admission():
+            with track_latency() as timing:
+                response_text, raw_response, provider_label, provider_model, provider_pricing = self._invoke_non_stream(
+                    messages=messages, overrides=overrides
+                )
+
+            masked_response_text = response_text
+            if self.redact_restore_in_response:
+                response_text = restore_text(response_text, self._last_redaction_map)
+
+            metadata = build_structured_output(
+                model_name=provider_model,
+                response_text=response_text,
+                raw_response=raw_response,
+                latency_ms=timing["latency_ms"],
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
+                extra_fields={"provider_used": provider_label},
             )
-
-        masked_response_text = response_text
-        if self.redact_restore_in_response:
-            response_text = restore_text(response_text, self._last_redaction_map)
-
-        metadata = build_structured_output(
-            model_name=provider_model,
-            response_text=response_text,
-            raw_response=raw_response,
-            latency_ms=timing["latency_ms"],
-            input_pricing=provider_pricing[0],
-            output_pricing=provider_pricing[1],
-            extra_fields={"provider_used": provider_label},
-        )
-        self.last_metadata = metadata
-        self._record_session_cost(metadata.get("total_cost"))
-        self._log_to_ledger(
-            call_type="invoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
-        )
+            self.last_metadata = metadata
+            self._record_session_cost(metadata.get("total_cost"))
+            self._log_to_ledger(
+                call_type="invoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
+            )
+        # Shadow dispatch is observation-only and its cost is never counted
+        # toward max_session_cost -- run it after releasing the budget
+        # admission lock so it doesn't hold up other calls' admission checks.
         self._dispatch_shadow_sync(messages, response_text)
         return metadata if self.structured_output else response_text
 
@@ -1191,29 +1202,33 @@ class OpenAIChatModel(BaseLLM):
                 chunks.append(delta)
             return "".join(chunks)
 
-        with track_latency() as timing:
-            response_text, raw_response, provider_label, provider_model, provider_pricing = await self._ainvoke_non_stream(
-                messages=messages, overrides=overrides
+        async with self._async_budget_admission():
+            with track_latency() as timing:
+                response_text, raw_response, provider_label, provider_model, provider_pricing = await self._ainvoke_non_stream(
+                    messages=messages, overrides=overrides
+                )
+
+            masked_response_text = response_text
+            if self.redact_restore_in_response:
+                response_text = restore_text(response_text, self._last_redaction_map)
+
+            metadata = build_structured_output(
+                model_name=provider_model,
+                response_text=response_text,
+                raw_response=raw_response,
+                latency_ms=timing["latency_ms"],
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
+                extra_fields={"provider_used": provider_label},
             )
-
-        masked_response_text = response_text
-        if self.redact_restore_in_response:
-            response_text = restore_text(response_text, self._last_redaction_map)
-
-        metadata = build_structured_output(
-            model_name=provider_model,
-            response_text=response_text,
-            raw_response=raw_response,
-            latency_ms=timing["latency_ms"],
-            input_pricing=provider_pricing[0],
-            output_pricing=provider_pricing[1],
-            extra_fields={"provider_used": provider_label},
-        )
-        self.last_metadata = metadata
-        self._record_session_cost(metadata.get("total_cost"))
-        self._log_to_ledger(
-            call_type="ainvoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
-        )
+            self.last_metadata = metadata
+            self._record_session_cost(metadata.get("total_cost"))
+            self._log_to_ledger(
+                call_type="ainvoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
+            )
+        # Shadow dispatch is observation-only and its cost is never counted
+        # toward max_session_cost -- run it after releasing the budget
+        # admission lock so it doesn't hold up other calls' admission checks.
         await self._dispatch_shadow_async(messages, response_text)
         return metadata if self.structured_output else response_text
 
@@ -1278,48 +1293,49 @@ class OpenAIChatModel(BaseLLM):
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
-        last_error: Optional[Exception] = None
-        last_text: Optional[str] = None
-        for attempt in range(max_validation_retries + 1):
-            with track_latency() as timing:
-                response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                    self._invoke_non_stream(messages=messages)
+        with self._budget_admission():
+            last_error: Optional[Exception] = None
+            last_text: Optional[str] = None
+            for attempt in range(max_validation_retries + 1):
+                with track_latency() as timing:
+                    response_text, raw_response, provider_label, provider_model, provider_pricing = (
+                        self._invoke_non_stream(messages=messages)
+                    )
+                masked_response_text = response_text
+                text_to_validate = response_text
+                if self.redact_restore_in_response:
+                    text_to_validate = restore_text(response_text, self._last_redaction_map)
+                last_text = text_to_validate
+                try:
+                    validated = self.output_schema.model_validate_json(text_to_validate)
+                except Exception as exc:
+                    last_error = exc
+                    # Feed back the model's own (still-masked) output — never the restored
+                    # text, which would leak the real secret into the model's own context.
+                    messages = messages + self._correction_messages(masked_response_text, exc)
+                    continue
+                self.last_metadata = build_structured_output(
+                    model_name=provider_model,
+                    response_text=text_to_validate,
+                    raw_response=raw_response,
+                    latency_ms=timing["latency_ms"],
+                    input_pricing=provider_pricing[0],
+                    output_pricing=provider_pricing[1],
+                    extra_fields={"provider_used": provider_label, "validation_retries": attempt},
                 )
-            masked_response_text = response_text
-            text_to_validate = response_text
-            if self.redact_restore_in_response:
-                text_to_validate = restore_text(response_text, self._last_redaction_map)
-            last_text = text_to_validate
-            try:
-                validated = self.output_schema.model_validate_json(text_to_validate)
-            except Exception as exc:
-                last_error = exc
-                # Feed back the model's own (still-masked) output — never the restored
-                # text, which would leak the real secret into the model's own context.
-                messages = messages + self._correction_messages(masked_response_text, exc)
-                continue
-            self.last_metadata = build_structured_output(
-                model_name=provider_model,
-                response_text=text_to_validate,
-                raw_response=raw_response,
-                latency_ms=timing["latency_ms"],
-                input_pricing=provider_pricing[0],
-                output_pricing=provider_pricing[1],
-                extra_fields={"provider_used": provider_label, "validation_retries": attempt},
-            )
-            self._record_session_cost(self.last_metadata.get("total_cost"))
-            self._log_to_ledger(
-                call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata,
-                response_override=masked_response_text,
-            )
-            return validated
+                self._record_session_cost(self.last_metadata.get("total_cost"))
+                self._log_to_ledger(
+                    call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata,
+                    response_override=masked_response_text,
+                )
+                return validated
 
-        raise OpenAIChatModelValidationError(
-            f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
-            f"Last error: {last_error}",
-            raw_text=last_text,
-            validation_error=last_error,
-        )
+            raise OpenAIChatModelValidationError(
+                f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
+                f"Last error: {last_error}",
+                raw_text=last_text,
+                validation_error=last_error,
+            )
 
     async def ainvoke_structured(
         self,
@@ -1336,48 +1352,49 @@ class OpenAIChatModel(BaseLLM):
         resolved = self._resolve_prompt(prompt, prompt_variables, files)
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
 
-        last_error: Optional[Exception] = None
-        last_text: Optional[str] = None
-        for attempt in range(max_validation_retries + 1):
-            with track_latency() as timing:
-                response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                    await self._ainvoke_non_stream(messages=messages)
+        async with self._async_budget_admission():
+            last_error: Optional[Exception] = None
+            last_text: Optional[str] = None
+            for attempt in range(max_validation_retries + 1):
+                with track_latency() as timing:
+                    response_text, raw_response, provider_label, provider_model, provider_pricing = (
+                        await self._ainvoke_non_stream(messages=messages)
+                    )
+                masked_response_text = response_text
+                text_to_validate = response_text
+                if self.redact_restore_in_response:
+                    text_to_validate = restore_text(response_text, self._last_redaction_map)
+                last_text = text_to_validate
+                try:
+                    validated = self.output_schema.model_validate_json(text_to_validate)
+                except Exception as exc:
+                    last_error = exc
+                    # Feed back the model's own (still-masked) output — never the restored
+                    # text, which would leak the real secret into the model's own context.
+                    messages = messages + self._correction_messages(masked_response_text, exc)
+                    continue
+                self.last_metadata = build_structured_output(
+                    model_name=provider_model,
+                    response_text=text_to_validate,
+                    raw_response=raw_response,
+                    latency_ms=timing["latency_ms"],
+                    input_pricing=provider_pricing[0],
+                    output_pricing=provider_pricing[1],
+                    extra_fields={"provider_used": provider_label, "validation_retries": attempt},
                 )
-            masked_response_text = response_text
-            text_to_validate = response_text
-            if self.redact_restore_in_response:
-                text_to_validate = restore_text(response_text, self._last_redaction_map)
-            last_text = text_to_validate
-            try:
-                validated = self.output_schema.model_validate_json(text_to_validate)
-            except Exception as exc:
-                last_error = exc
-                # Feed back the model's own (still-masked) output — never the restored
-                # text, which would leak the real secret into the model's own context.
-                messages = messages + self._correction_messages(masked_response_text, exc)
-                continue
-            self.last_metadata = build_structured_output(
-                model_name=provider_model,
-                response_text=text_to_validate,
-                raw_response=raw_response,
-                latency_ms=timing["latency_ms"],
-                input_pricing=provider_pricing[0],
-                output_pricing=provider_pricing[1],
-                extra_fields={"provider_used": provider_label, "validation_retries": attempt},
-            )
-            self._record_session_cost(self.last_metadata.get("total_cost"))
-            self._log_to_ledger(
-                call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata,
-                response_override=masked_response_text,
-            )
-            return validated
+                self._record_session_cost(self.last_metadata.get("total_cost"))
+                self._log_to_ledger(
+                    call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata,
+                    response_override=masked_response_text,
+                )
+                return validated
 
-        raise OpenAIChatModelValidationError(
-            f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
-            f"Last error: {last_error}",
-            raw_text=last_text,
-            validation_error=last_error,
-        )
+            raise OpenAIChatModelValidationError(
+                f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
+                f"Last error: {last_error}",
+                raw_text=last_text,
+                validation_error=last_error,
+            )
 
     def stream(
         self,
