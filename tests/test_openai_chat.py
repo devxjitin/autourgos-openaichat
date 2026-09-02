@@ -1211,6 +1211,48 @@ def test_redaction_mask_mode_replaces_email_and_api_key():
     assert set(llm.last_redacted_categories) == {"email", "api_key"}
 
 
+def test_redaction_applies_to_invoke_with_tools():
+    """
+    Regression: invoke_with_tools()/ainvoke_with_tools() used to build
+    messages directly from the raw prompt, bypassing _resolve_prompt()'s
+    redaction step entirely — redact_pii=True had no effect on tool-calling
+    requests. They must go through the same redaction pipeline as invoke().
+    """
+    llm = make_llm(redact_pii=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke_with_tools(
+        "contact me at bob@example.com", [{"name": "noop", "parameters": {}}]
+    )
+    sent = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    text = sent[0]["content"]
+    assert "bob@example.com" not in text
+    assert "[REDACTED:email]" in text
+    assert llm.last_redacted_categories == ["email"]
+
+
+def test_redaction_applies_to_ainvoke_with_tools():
+    llm = make_llm(redact_pii=True)
+    llm._async_client.chat.completions.create = AsyncMock(return_value=make_completion("ok"))
+
+    async def run():
+        return await llm.ainvoke_with_tools(
+            "contact me at bob@example.com", [{"name": "noop", "parameters": {}}]
+        )
+
+    asyncio.run(run())
+    sent = llm._async_client.chat.completions.create.call_args.kwargs["messages"]
+    text = sent[0]["content"]
+    assert "bob@example.com" not in text
+    assert "[REDACTED:email]" in text
+
+
+def test_redact_mode_block_raises_before_api_call_for_invoke_with_tools():
+    llm = make_llm(redact_pii=True, redact_mode="block")
+    with pytest.raises(OpenAIChatModelRedactionBlockedError):
+        llm.invoke_with_tools("my email is bob@example.com", [{"name": "noop", "parameters": {}}])
+    llm._client.chat.completions.create.assert_not_called()
+
+
 def test_redaction_block_mode_raises_before_api_call():
     llm = make_llm(redact_pii=True, redact_mode="block")
     with pytest.raises(OpenAIChatModelRedactionBlockedError) as exc_info:

@@ -1496,7 +1496,8 @@ class OpenAIChatModel(BaseLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        messages = self._build_messages(prompt, files=files, image_detail=image_detail)
+        resolved = self._resolve_prompt(prompt, None, files)
+        messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
         params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)
         if openai_tools:
@@ -1519,7 +1520,8 @@ class OpenAIChatModel(BaseLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        messages = self._build_messages(prompt, files=files, image_detail=image_detail)
+        resolved = self._resolve_prompt(prompt, None, files)
+        messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
         params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)
         if openai_tools:
