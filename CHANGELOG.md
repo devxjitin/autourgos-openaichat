@@ -1,5 +1,48 @@
 # Changelog
 
+## [2.5.0] - 2026-09-02
+
+- Fixed: `invoke_with_tools()`/`ainvoke_with_tools()` built messages directly from
+  the raw prompt via `_build_messages()`, bypassing `_resolve_prompt()`'s
+  redaction step entirely — `redact_pii=True` (mask or block) had no effect on
+  native tool-calling requests. They now route through `_resolve_prompt()`
+  like every other call path, matching `autourgos-responses`'s
+  `OpenAIResponse.invoke_with_tools()`, which already did this correctly.
+- Fixed: the circuit breaker counted `OpenAIChatModelConfigError` (a caller/
+  config mistake) and `OpenAIChatModelRedactionBlockedError` (`redact_mode=
+  "block"` correctly refusing a PII-matching prompt) as transient API
+  failures — repeated config mistakes or a burst of legitimately-blocked
+  prompts could trip the breaker and block every other call on the same
+  instance, even though the provider itself was healthy. Added a
+  `NonTransientError` marker mixin (`llm.py`), now mixed into both exception
+  classes and exempted from the circuit breaker's failure count.
+- Fixed: `normalize_model_name()` force-lowercased the model identifier that
+  is actually sent in every request's `model` field, silently breaking
+  case-sensitive identifiers — Azure OpenAI deployment names (user-chosen,
+  case-sensitive strings) and self-hosted/vLLM model tags, both explicitly
+  advertised as supported. Now only strips surrounding whitespace; case is
+  preserved.
+- Fixed: `_check_budget()`/`_record_session_cost()` weren't atomic together,
+  so N concurrent calls sharing one `max_session_cost`-capped instance (e.g.
+  via `abatch_invoke()`) could all pass the budget check before any of them
+  recorded cost, overshooting the cap by up to N-1 calls' worth. Added
+  `_budget_admission()`/`_async_budget_admission()` context managers that
+  serialize admission (within each concurrency domain) from the re-check
+  through the caller's entire critical section.
+- Fixed: `stream()`/`astream()` were never wrapped by the circuit breaker —
+  a mid-stream failure never counted toward it, and even an already-open
+  circuit didn't stop them from hitting a known-down provider. Added
+  `_wrap_sync_stream()`/`_wrap_async_stream()`, which check/trip the circuit
+  around the call and around the full iteration of the returned stream.
+- Added: `max_call_duration=` — an optional aggregate wall-clock deadline
+  (seconds) for one logical call, covering every retry attempt and (if
+  configured) every fallback provider. Without it, retries and fallback each
+  get their own full retry budget independently, with no cap on total time.
+  Checked between attempts/providers (not by cancelling an in-flight
+  request); raises the new `OpenAIChatModelDeadlineExceededError` once
+  exceeded. `None` (default) disables this — no behavior change for
+  existing callers.
+
 ## [2.4.2] - 2026-09-02
 
 - Fixed: `configure_openai_client`/`configure_async_openai_client` now pass
