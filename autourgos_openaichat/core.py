@@ -60,6 +60,10 @@ def configure_openai_client(
         kwargs["project"] = project
     if timeout is not None:
         kwargs["timeout"] = timeout
+    # The wrapper owns retry/backoff (see chat.py's retry loop). Without this,
+    # the openai SDK's own default max_retries=2 retries underneath the
+    # wrapper's retries, silently multiplying attempts and latency.
+    kwargs["max_retries"] = 0
     return openai_cls(**kwargs)
 
 
@@ -84,6 +88,9 @@ def configure_async_openai_client(
         kwargs["project"] = project
     if timeout is not None:
         kwargs["timeout"] = timeout
+    # See configure_openai_client: the wrapper owns retry/backoff, so the SDK
+    # must not retry underneath it.
+    kwargs["max_retries"] = 0
     return async_openai_cls(**kwargs)
 
 
