@@ -588,6 +588,85 @@ def test_circuit_breaker_ignores_redaction_blocked_as_non_transient():
     assert llm.invoke("hi") == "ok"  # not blocked by a tripped circuit
 
 
+def test_stream_failures_trip_the_circuit_breaker():
+    """
+    Regression: stream()/astream() used to bypass the circuit breaker
+    entirely -- a mid-stream failure never incremented consecutive_failures,
+    so no number of failing stream() calls could ever trip it.
+    """
+    def failing_stream(**kwargs):
+        raise ConnectionError("boom")
+        yield  # pragma: no cover -- makes this a generator function
+
+    llm = make_llm(circuit_failure_threshold=2, max_retries=1)
+    llm._client.chat.completions.create.side_effect = lambda **kwargs: failing_stream(**kwargs)
+
+    for _ in range(2):
+        with pytest.raises(OpenAIChatModelAPIError):
+            list(llm.stream("hi"))
+    assert llm._consecutive_failures == 2
+
+    # Circuit is now open -- must raise immediately, without even attempting
+    # to iterate (and thus without ever reaching the client).
+    llm._client.chat.completions.create.reset_mock(side_effect=True)
+    with pytest.raises(CircuitBreakerOpenException):
+        llm.stream("hi")
+    llm._client.chat.completions.create.assert_not_called()
+
+
+def test_stream_success_resets_the_circuit_breaker():
+    llm = make_llm(circuit_failure_threshold=2, max_retries=1)
+    llm._client.chat.completions.create.side_effect = lambda **kwargs: (_ for _ in ()).throw(ConnectionError("boom"))
+    with pytest.raises(OpenAIChatModelAPIError):
+        list(llm.stream("hi"))
+    assert llm._consecutive_failures == 1
+
+    llm._client.chat.completions.create.side_effect = None
+    llm._client.chat.completions.create.return_value = FakeSyncStream(make_stream_chunks(["ok"]))
+    assert list(llm.stream("hi")) == ["ok"]
+    assert llm._consecutive_failures == 0
+
+
+def test_circuit_breaker_already_open_blocks_stream_before_iteration():
+    """A circuit tripped by invoke() failures must also block stream() calls,
+    instead of letting them keep hitting a known-down provider."""
+    llm = make_llm(circuit_failure_threshold=1, max_retries=1)
+    llm._client.chat.completions.create.side_effect = ConnectionError("boom")
+    with pytest.raises(OpenAIChatModelAPIError):
+        llm.invoke("hi")
+
+    llm._client.chat.completions.create.reset_mock(side_effect=True)
+    with pytest.raises(CircuitBreakerOpenException):
+        llm.stream("hi")  # raised by calling stream(), before any iteration
+    llm._client.chat.completions.create.assert_not_called()
+
+
+def test_astream_failures_trip_the_circuit_breaker():
+    async def failing_astream(**kwargs):
+        raise ConnectionError("boom")
+        yield  # pragma: no cover -- makes this an async generator function
+
+    llm = make_llm(circuit_failure_threshold=2, max_retries=1)
+    llm._async_client.chat.completions.create.side_effect = lambda **kwargs: failing_astream(**kwargs)
+
+    async def run():
+        return [c async for c in llm.astream("hi")]
+
+    for _ in range(2):
+        with pytest.raises(OpenAIChatModelAPIError):
+            asyncio.run(run())
+    assert llm._consecutive_failures == 2
+
+    llm._async_client.chat.completions.create.reset_mock(side_effect=True)
+
+    async def run_after_trip():
+        return [c async for c in llm.astream("hi")]
+
+    with pytest.raises(CircuitBreakerOpenException):
+        asyncio.run(run_after_trip())
+    llm._async_client.chat.completions.create.assert_not_called()
+
+
 # ── 16. Error handling ───────────────────────────────────────────────────────
 
 def test_config_error_streaming_and_structured_output():

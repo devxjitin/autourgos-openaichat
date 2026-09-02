@@ -196,6 +196,10 @@ class BaseLLM(ABC):
             cls.invoke_structured = cls._wrap_sync(cls.invoke_structured)
         if "ainvoke_structured" in cls.__dict__:
             cls.ainvoke_structured = cls._wrap_async(cls.ainvoke_structured)
+        if "stream" in cls.__dict__:
+            cls.stream = cls._wrap_sync_stream(cls.stream)
+        if "astream" in cls.__dict__:
+            cls.astream = cls._wrap_async_stream(cls.astream)
 
     # ── Circuit breaker wrappers ──────────────────────────────────────────────
 
@@ -291,6 +295,126 @@ class BaseLLM(ABC):
                         if self._consecutive_failures >= self.circuit_failure_threshold:
                             self._circuit_tripped_until = time.time() + self.circuit_cooldown_time
                 raise
+
+        return wrapper
+
+    # ── Circuit breaker wrappers for streaming ───────────────────────────────
+    # stream()/astream() return an iterator/async-iterator rather than a
+    # value or awaitable, so _wrap_sync/_wrap_async can't be reused as-is:
+    # calling a generator function doesn't run its body until it's first
+    # iterated, so treating a mere call as "success" would reset the circuit
+    # before any actual request happened, and a mid-stream failure (raised
+    # partway through iteration, not from the call itself) would never be
+    # observed at all. These wrappers check/trip the circuit around the call
+    # (so a call while the circuit is open still raises immediately, without
+    # requiring the caller to start iterating first) and around the full
+    # iteration of whatever stream()/astream() returns.
+
+    @staticmethod
+    def _wrap_sync_stream(func: Callable) -> Callable:
+        @functools.wraps(func)
+        def wrapper(self: "BaseLLM", *args: Any, **kwargs: Any) -> Iterator[Any]:
+            if not hasattr(self, "_circuit_lock"):
+                with _lazy_init_lock:
+                    if not hasattr(self, "_circuit_lock"):
+                        self._circuit_lock = threading.Lock()
+                        self._consecutive_failures = 0
+                        self._circuit_tripped_until = None
+                        self.circuit_failure_threshold = 5
+                        self.circuit_cooldown_time = 30.0
+
+            with self._circuit_lock:
+                if self._circuit_tripped_until is not None:
+                    if time.time() < self._circuit_tripped_until:
+                        raise CircuitBreakerOpenException(
+                            f"Circuit breaker OPEN for {type(self).__name__} — "
+                            f"{self._consecutive_failures} consecutive failures. "
+                            f"Blocked until {self._circuit_tripped_until}."
+                        )
+                    self._circuit_tripped_until = None
+
+            # func(...) itself must run eagerly here (not inside the generator
+            # below) so a caller building the iterator while the circuit is
+            # open sees CircuitBreakerOpenException immediately, matching
+            # invoke()'s behavior, instead of only on first iteration.
+            stream = func(self, *args, **kwargs)
+            return self._consume_stream_for_circuit(stream)
+
+        return wrapper
+
+    def _consume_stream_for_circuit(self, stream: Iterator[Any]) -> Iterator[Any]:
+        """Drive `stream`, updating the circuit breaker based on whether it raises."""
+        try:
+            for item in stream:
+                yield item
+        except Exception as exc:
+            if not isinstance(exc, (
+                TypeError, ValueError, KeyError, AttributeError,
+                NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
+                NonTransientError,
+            )):
+                with self._circuit_lock:
+                    self._consecutive_failures += 1
+                    if self._consecutive_failures >= self.circuit_failure_threshold:
+                        self._circuit_tripped_until = time.time() + self.circuit_cooldown_time
+            raise
+        else:
+            with self._circuit_lock:
+                self._consecutive_failures = 0
+
+    @staticmethod
+    def _wrap_async_stream(func: Callable) -> Callable:
+        @functools.wraps(func)
+        async def wrapper(self: "BaseLLM", *args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+            if not hasattr(self, "_circuit_lock"):
+                with _lazy_init_lock:
+                    if not hasattr(self, "_circuit_lock"):
+                        self._circuit_lock = threading.Lock()
+                        self._async_circuit_lock = None
+                        self._consecutive_failures = 0
+                        self._circuit_tripped_until = None
+                        self.circuit_failure_threshold = 5
+                        self.circuit_cooldown_time = 30.0
+
+            if self._async_circuit_lock is None:
+                with _lazy_init_lock:
+                    if self._async_circuit_lock is None:
+                        self._async_circuit_lock = asyncio.Lock()
+
+            async with self._async_circuit_lock:
+                if self._circuit_tripped_until is not None:
+                    if time.time() < self._circuit_tripped_until:
+                        raise CircuitBreakerOpenException(
+                            f"Circuit breaker OPEN for {type(self).__name__} — "
+                            f"{self._consecutive_failures} consecutive failures. "
+                            f"Blocked until {self._circuit_tripped_until}."
+                        )
+                    self._circuit_tripped_until = None
+
+            # `wrapper` is itself an async generator (it yields below), so
+            # nothing above this point actually runs until the caller's first
+            # `__anext__()` -- consistent with how an unwrapped astream()
+            # already behaves (nothing happens until iteration starts), so
+            # this doesn't change when the circuit is observably checked
+            # relative to the pre-fix behavior for astream() specifically.
+            stream = func(self, *args, **kwargs)
+            try:
+                async for item in stream:
+                    yield item
+            except Exception as exc:
+                if not isinstance(exc, (
+                    TypeError, ValueError, KeyError, AttributeError,
+                    NotImplementedError, CircuitBreakerOpenException, BudgetExceededException,
+                    NonTransientError,
+                )):
+                    async with self._async_circuit_lock:
+                        self._consecutive_failures += 1
+                        if self._consecutive_failures >= self.circuit_failure_threshold:
+                            self._circuit_tripped_until = time.time() + self.circuit_cooldown_time
+                raise
+            else:
+                async with self._async_circuit_lock:
+                    self._consecutive_failures = 0
 
         return wrapper
 
