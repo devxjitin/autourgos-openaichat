@@ -124,8 +124,15 @@ async def release_async_openai_client(client: Any) -> None:
 # ── Model name normalization ──────────────────────────────────────────────────
 
 def normalize_model_name(model: str) -> str:
-    """Strip whitespace and lowercase the model identifier."""
-    return model.strip().lower() if model else model
+    """
+    Strip surrounding whitespace from the model identifier. Case is
+    preserved: this value is sent as-is in the ``model`` request field, and
+    forcing it to lowercase used to silently break case-sensitive
+    identifiers -- Azure OpenAI deployment names (user-chosen, case-sensitive
+    strings, not the base model name) and self-hosted/vLLM model tags -- by
+    sending a wrong (lowercased) value the API would then 404 on.
+    """
+    return model.strip() if model else model
 
 
 # ── Multi-modal message building ──────────────────────────────────────────────

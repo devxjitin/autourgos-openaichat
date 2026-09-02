@@ -664,9 +664,14 @@ def test_repr_contains_model_and_flags():
     assert "streaming=False" in r
 
 
-def test_normalize_model_name_lowercases():
-    llm = OpenAIChatModel(model="  GPT-4O  ", api_key="sk-test")
-    assert llm._model_name == "gpt-4o"
+def test_normalize_model_name_strips_whitespace_and_preserves_case():
+    """
+    Regression: model names/deployment identifiers can be case-sensitive
+    (Azure OpenAI deployment names, self-hosted/vLLM model tags) -- only
+    surrounding whitespace should be stripped, never the case.
+    """
+    llm = OpenAIChatModel(model="  GPT4o-Prod-Deployment  ", api_key="sk-test")
+    assert llm._model_name == "GPT4o-Prod-Deployment"
 
 
 # ── 19. Additional async / edge-case coverage ────────────────────────────────
