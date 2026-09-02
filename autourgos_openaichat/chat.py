@@ -223,10 +223,16 @@ class OpenAIChatModel(BaseLLM):
             circuit_cooldown_time: Seconds the circuit stays open before a probe attempt.
             fallback_providers: Ordered list of backup providers to try, each a dict with
                 "model" (required) and optional "api_key" / "base_url" / "organization" /
-                "project". Tried in order after the primary provider exhausts its retries.
-                Each entry resolves its own api_key/base_url independently (falling back to
-                OPENAI_API_KEY/OPENAI_BASE_URL env vars, same as the primary) — nothing is
-                inherited from the primary provider's credentials.
+                "project" / "input_pricing" / "output_pricing". Tried in order after the
+                primary provider exhausts its retries. Each entry resolves its own
+                api_key/base_url independently (falling back to OPENAI_API_KEY/
+                OPENAI_BASE_URL env vars, same as the primary) — nothing is inherited from
+                the primary provider's credentials or pricing. When a fallback actually
+                answers, llm.last_metadata/the ledger report *that* fallback's own model
+                name, and cost is computed from its own "input_pricing"/"output_pricing"
+                (not the primary's — a fallback is typically a different, differently-priced
+                model). If a fallback entry doesn't set them, cost fields are simply omitted
+                for that call rather than computed with the wrong (primary's) price.
             ledger_path: If set, every invoke()/ainvoke()/invoke_structured()/
                 ainvoke_structured() call is recorded to a local SQLite file at this path
                 (created if it doesn't exist). None (default) disables the ledger entirely.
@@ -269,12 +275,15 @@ class OpenAIChatModel(BaseLLM):
                 Requires redact_pii=True and redact_mode="mask".
             shadow_providers: Providers to dispatch the same prompt to concurrently with the
                 primary, for comparison only — invoke()/ainvoke() always return the primary's
-                result. Same entry shape as fallback_providers. Each shadow provider gets a
-                single attempt (no retries). Results land in llm.last_shadow_results and,
-                if a ledger is configured, in the shadow_calls table. Adds latency roughly
-                equal to the slower of (primary, slowest shadow) rather than their sum, and
-                each shadow call costs real money that is NOT counted toward
-                max_session_cost. Only invoke()/ainvoke() dispatch shadows in this version.
+                result. Same entry shape as fallback_providers, including its own optional
+                "input_pricing"/"output_pricing" — a shadow result's cost is computed from
+                that entry's own pricing (never the primary's), and left unset if the entry
+                doesn't provide it. Each shadow provider gets a single attempt (no retries).
+                Results land in llm.last_shadow_results and, if a ledger is configured, in
+                the shadow_calls table. Adds latency roughly equal to the slower of (primary,
+                slowest shadow) rather than their sum, and each shadow call costs real money
+                that is NOT counted toward max_session_cost. Only invoke()/ainvoke() dispatch
+                shadows in this version.
             on_shadow_result: Optional callback invoked with each shadow result dict as it
                 completes.
             extra_body: Raw provider-specific request fields merged into every request
@@ -437,23 +446,32 @@ class OpenAIChatModel(BaseLLM):
         return self._fallback_async_clients[index]
 
     def _sync_targets(self) -> Iterator[tuple]:
-        """Yield (label, model_name, client) for the primary, then each fallback in order."""
-        yield "primary", self._model_name, self._client
+        """
+        Yield (label, model_name, client, pricing) for the primary, then each
+        fallback in order. ``pricing`` is (input_pricing, output_pricing) —
+        the primary's constructor-level pricing, or a fallback entry's own
+        "input_pricing"/"output_pricing" keys (None if it doesn't set them,
+        never inherited from the primary — a fallback is typically a
+        different model with a different price).
+        """
+        yield "primary", self._model_name, self._client, (self.input_pricing, self.output_pricing)
         for i, cfg in enumerate(self.fallback_providers):
             yield (
                 f"fallback[{i}]:{cfg['model']}",
                 normalize_model_name(cfg["model"]),
                 self._get_fallback_sync_client(i),
+                (cfg.get("input_pricing"), cfg.get("output_pricing")),
             )
 
     def _async_targets(self) -> Iterator[tuple]:
-        """Yield (label, model_name, client) for the primary, then each fallback in order."""
-        yield "primary", self._model_name, self._async_client
+        """Async counterpart of ``_sync_targets()``. See its docstring for ``pricing``."""
+        yield "primary", self._model_name, self._async_client, (self.input_pricing, self.output_pricing)
         for i, cfg in enumerate(self.fallback_providers):
             yield (
                 f"fallback[{i}]:{cfg['model']}",
                 normalize_model_name(cfg["model"]),
                 self._get_fallback_async_client(i),
+                (cfg.get("input_pricing"), cfg.get("output_pricing")),
             )
 
     def _get_shadow_sync_client(self, index: int) -> Any:
@@ -485,21 +503,28 @@ class OpenAIChatModel(BaseLLM):
         return self._shadow_async_clients[index]
 
     def _shadow_targets(self) -> Iterator[tuple]:
-        """Yield (label, model_name, client) for each configured shadow provider."""
+        """
+        Yield (label, model_name, client, pricing) for each configured shadow
+        provider. ``pricing`` is that shadow entry's own "input_pricing"/
+        "output_pricing" keys (None if unset) — never the primary's, since a
+        shadow provider is typically a different model with a different price.
+        """
         for i, cfg in enumerate(self.shadow_providers):
             yield (
                 f"shadow[{i}]:{cfg['model']}",
                 normalize_model_name(cfg["model"]),
                 self._get_shadow_sync_client(i),
+                (cfg.get("input_pricing"), cfg.get("output_pricing")),
             )
 
     def _async_shadow_targets(self) -> Iterator[tuple]:
-        """Yield (label, model_name, client) for each configured shadow provider."""
+        """Async counterpart of ``_shadow_targets()``. See its docstring for ``pricing``."""
         for i, cfg in enumerate(self.shadow_providers):
             yield (
                 f"shadow[{i}]:{cfg['model']}",
                 normalize_model_name(cfg["model"]),
                 self._get_shadow_async_client(i),
+                (cfg.get("input_pricing"), cfg.get("output_pricing")),
             )
 
     # ── Context managers ──────────────────────────────────────────────────────
@@ -599,6 +624,7 @@ class OpenAIChatModel(BaseLLM):
         primary_text: Optional[str],
         latency_ms: float,
         error: Optional[str],
+        pricing: "tuple[Optional[float], Optional[float]]",
     ) -> Dict[str, Any]:
         if error is not None:
             return {
@@ -607,14 +633,15 @@ class OpenAIChatModel(BaseLLM):
                 "latency_ms": latency_ms, "error": error,
             }
         usage = extract_usage_metadata(raw_response)
+        input_pricing, output_pricing = pricing
         total_cost = None
         if (
-            self.input_pricing is not None and self.output_pricing is not None
+            input_pricing is not None and output_pricing is not None
             and usage["input_tokens"] is not None and usage["output_tokens"] is not None
         ):
             total_cost = (
-                (usage["input_tokens"] / 1_000_000) * self.input_pricing
-                + (usage["output_tokens"] / 1_000_000) * self.output_pricing
+                (usage["input_tokens"] / 1_000_000) * input_pricing
+                + (usage["output_tokens"] / 1_000_000) * output_pricing
             )
         return {
             "provider_used": label,
@@ -645,8 +672,8 @@ class OpenAIChatModel(BaseLLM):
 
     def _finalize_shadow_results(self, raw_results: List[tuple], primary_text: Optional[str]) -> None:
         results = []
-        for label, text, raw, latency_ms, error in raw_results:
-            result = self._build_shadow_result(label, text, raw, primary_text, latency_ms, error)
+        for label, text, raw, latency_ms, error, pricing in raw_results:
+            result = self._build_shadow_result(label, text, raw, primary_text, latency_ms, error, pricing)
             results.append(result)
             self._log_shadow_to_ledger(result)
             if self.on_shadow_result is not None:
@@ -657,7 +684,7 @@ class OpenAIChatModel(BaseLLM):
         self.last_shadow_results = results
 
     def _execute_shadow_attempt_sync(
-        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]]
+        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]], pricing: tuple
     ) -> tuple:
         params = dict(self._build_base_params(messages=messages, stream=False))
         params["model"] = model_name
@@ -666,13 +693,13 @@ class OpenAIChatModel(BaseLLM):
             raw = client.chat.completions.create(**params)
             text = extract_text_from_response(raw)
             latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, text, raw, latency_ms, None
+            return label, text, raw, latency_ms, None, pricing
         except Exception as exc:
             latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}"
+            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}", pricing
 
     async def _execute_shadow_attempt_async(
-        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]]
+        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]], pricing: tuple
     ) -> tuple:
         params = dict(self._build_base_params(messages=messages, stream=False))
         params["model"] = model_name
@@ -681,10 +708,10 @@ class OpenAIChatModel(BaseLLM):
             raw = await client.chat.completions.create(**params)
             text = extract_text_from_response(raw)
             latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, text, raw, latency_ms, None
+            return label, text, raw, latency_ms, None, pricing
         except Exception as exc:
             latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}"
+            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}", pricing
 
     def _dispatch_shadow_sync(self, messages: List[Dict[str, Any]], primary_text: Optional[str]) -> None:
         if not self.shadow_providers:
@@ -693,8 +720,8 @@ class OpenAIChatModel(BaseLLM):
         targets = list(self._shadow_targets())
         with ThreadPoolExecutor(max_workers=len(targets)) as executor:
             futures = [
-                executor.submit(self._execute_shadow_attempt_sync, label, model_name, client, messages)
-                for label, model_name, client in targets
+                executor.submit(self._execute_shadow_attempt_sync, label, model_name, client, messages, pricing)
+                for label, model_name, client, pricing in targets
             ]
             raw_results = [f.result() for f in futures]
         self._finalize_shadow_results(raw_results, primary_text)
@@ -705,8 +732,8 @@ class OpenAIChatModel(BaseLLM):
             return
         targets = list(self._async_shadow_targets())
         raw_results = list(await asyncio.gather(*[
-            self._execute_shadow_attempt_async(label, model_name, client, messages)
-            for label, model_name, client in targets
+            self._execute_shadow_attempt_async(label, model_name, client, messages, pricing)
+            for label, model_name, client, pricing in targets
         ]))
         self._finalize_shadow_results(raw_results, primary_text)
 
@@ -879,13 +906,19 @@ class OpenAIChatModel(BaseLLM):
     # ── Raw API calls across primary + fallback providers ───────────────────────
 
     def _create_across_providers(self, params: Dict[str, Any]) -> tuple:
-        """Try the primary, then each fallback provider in order. Returns (raw, label)."""
+        """
+        Try the primary, then each fallback provider in order.
+
+        Returns (raw, label, model_name, pricing) — ``model_name`` and
+        ``pricing`` describe whichever target actually answered, not always
+        the primary, so callers can attribute metadata/cost correctly.
+        """
         attempts: List[Any] = []
-        for label, model_name, client in self._sync_targets():
+        for label, model_name, client, pricing in self._sync_targets():
             attempt_params = dict(params)
             attempt_params["model"] = model_name
             try:
-                return self._attempt_sync_create(client, attempt_params, label), label
+                return self._attempt_sync_create(client, attempt_params, label), label, model_name, pricing
             except OpenAIChatModelAPIError as exc:
                 attempts.append((label, exc))
         if len(attempts) == 1:
@@ -897,13 +930,13 @@ class OpenAIChatModel(BaseLLM):
         )
 
     async def _acreate_across_providers(self, params: Dict[str, Any]) -> tuple:
-        """Try the primary, then each fallback provider in order. Returns (raw, label)."""
+        """Async counterpart of ``_create_across_providers()``. See its docstring for the return shape."""
         attempts: List[Any] = []
-        for label, model_name, client in self._async_targets():
+        for label, model_name, client, pricing in self._async_targets():
             attempt_params = dict(params)
             attempt_params["model"] = model_name
             try:
-                return await self._attempt_async_create(client, attempt_params, label), label
+                return await self._attempt_async_create(client, attempt_params, label), label, model_name, pricing
             except OpenAIChatModelAPIError as exc:
                 attempts.append((label, exc))
         if len(attempts) == 1:
@@ -920,10 +953,10 @@ class OpenAIChatModel(BaseLLM):
         self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
     ) -> Any:
         params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
-        resp, provider_label = self._create_across_providers(params)
+        resp, provider_label, provider_model, provider_pricing = self._create_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
-            return text, resp, provider_label
+            return text, resp, provider_label, provider_model, provider_pricing
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the Chat Completions response."
         )
@@ -932,10 +965,10 @@ class OpenAIChatModel(BaseLLM):
         self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
     ) -> Any:
         params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
-        resp, provider_label = await self._acreate_across_providers(params)
+        resp, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(params)
         text = extract_text_from_response(resp)
         if text:
-            return text, resp, provider_label
+            return text, resp, provider_label, provider_model, provider_pricing
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the async Chat Completions response."
         )
@@ -950,7 +983,7 @@ class OpenAIChatModel(BaseLLM):
     ) -> Iterator[str]:
         base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
         attempts: List[Any] = []
-        for label, model_name, client in self._sync_targets():
+        for label, model_name, client, _pricing in self._sync_targets():
             params = dict(base_params)
             params["model"] = model_name
             last_exc: Optional[Exception] = None
@@ -1009,7 +1042,7 @@ class OpenAIChatModel(BaseLLM):
     ) -> AsyncIterator[str]:
         base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
         attempts: List[Any] = []
-        for label, model_name, client in self._async_targets():
+        for label, model_name, client, _pricing in self._async_targets():
             params = dict(base_params)
             params["model"] = model_name
             last_exc: Optional[Exception] = None
@@ -1100,7 +1133,7 @@ class OpenAIChatModel(BaseLLM):
             return "".join(self._invoke_stream_mode(messages=messages, overrides=overrides))
 
         with track_latency() as timing:
-            response_text, raw_response, provider_label = self._invoke_non_stream(
+            response_text, raw_response, provider_label, provider_model, provider_pricing = self._invoke_non_stream(
                 messages=messages, overrides=overrides
             )
 
@@ -1109,12 +1142,12 @@ class OpenAIChatModel(BaseLLM):
             response_text = restore_text(response_text, self._last_redaction_map)
 
         metadata = build_structured_output(
-            model_name=self._model_name,
+            model_name=provider_model,
             response_text=response_text,
             raw_response=raw_response,
             latency_ms=timing["latency_ms"],
-            input_pricing=self.input_pricing,
-            output_pricing=self.output_pricing,
+            input_pricing=provider_pricing[0],
+            output_pricing=provider_pricing[1],
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
@@ -1146,7 +1179,7 @@ class OpenAIChatModel(BaseLLM):
             return "".join(chunks)
 
         with track_latency() as timing:
-            response_text, raw_response, provider_label = await self._ainvoke_non_stream(
+            response_text, raw_response, provider_label, provider_model, provider_pricing = await self._ainvoke_non_stream(
                 messages=messages, overrides=overrides
             )
 
@@ -1155,12 +1188,12 @@ class OpenAIChatModel(BaseLLM):
             response_text = restore_text(response_text, self._last_redaction_map)
 
         metadata = build_structured_output(
-            model_name=self._model_name,
+            model_name=provider_model,
             response_text=response_text,
             raw_response=raw_response,
             latency_ms=timing["latency_ms"],
-            input_pricing=self.input_pricing,
-            output_pricing=self.output_pricing,
+            input_pricing=provider_pricing[0],
+            output_pricing=provider_pricing[1],
             extra_fields={"provider_used": provider_label},
         )
         self.last_metadata = metadata
@@ -1236,7 +1269,9 @@ class OpenAIChatModel(BaseLLM):
         last_text: Optional[str] = None
         for attempt in range(max_validation_retries + 1):
             with track_latency() as timing:
-                response_text, raw_response, provider_label = self._invoke_non_stream(messages=messages)
+                response_text, raw_response, provider_label, provider_model, provider_pricing = (
+                    self._invoke_non_stream(messages=messages)
+                )
             masked_response_text = response_text
             text_to_validate = response_text
             if self.redact_restore_in_response:
@@ -1251,12 +1286,12 @@ class OpenAIChatModel(BaseLLM):
                 messages = messages + self._correction_messages(masked_response_text, exc)
                 continue
             self.last_metadata = build_structured_output(
-                model_name=self._model_name,
+                model_name=provider_model,
                 response_text=text_to_validate,
                 raw_response=raw_response,
                 latency_ms=timing["latency_ms"],
-                input_pricing=self.input_pricing,
-                output_pricing=self.output_pricing,
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
             self._record_session_cost(self.last_metadata.get("total_cost"))
@@ -1292,7 +1327,9 @@ class OpenAIChatModel(BaseLLM):
         last_text: Optional[str] = None
         for attempt in range(max_validation_retries + 1):
             with track_latency() as timing:
-                response_text, raw_response, provider_label = await self._ainvoke_non_stream(messages=messages)
+                response_text, raw_response, provider_label, provider_model, provider_pricing = (
+                    await self._ainvoke_non_stream(messages=messages)
+                )
             masked_response_text = response_text
             text_to_validate = response_text
             if self.redact_restore_in_response:
@@ -1307,12 +1344,12 @@ class OpenAIChatModel(BaseLLM):
                 messages = messages + self._correction_messages(masked_response_text, exc)
                 continue
             self.last_metadata = build_structured_output(
-                model_name=self._model_name,
+                model_name=provider_model,
                 response_text=text_to_validate,
                 raw_response=raw_response,
                 latency_ms=timing["latency_ms"],
-                input_pricing=self.input_pricing,
-                output_pricing=self.output_pricing,
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
                 extra_fields={"provider_used": provider_label, "validation_retries": attempt},
             )
             self._record_session_cost(self.last_metadata.get("total_cost"))
@@ -1465,7 +1502,7 @@ class OpenAIChatModel(BaseLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = tool_choice
-        raw, _provider_label = self._create_across_providers(params)
+        raw, _provider_label, _provider_model, _provider_pricing = self._create_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)
@@ -1488,7 +1525,7 @@ class OpenAIChatModel(BaseLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = tool_choice
-        raw, _provider_label = await self._acreate_across_providers(params)
+        raw, _provider_label, _provider_model, _provider_pricing = await self._acreate_across_providers(params)
         tool_calls = self._parse_tool_calls(raw) if openai_tools else []
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)

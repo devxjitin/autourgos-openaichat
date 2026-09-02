@@ -821,12 +821,15 @@ def test_multimodal_real_url_string_read_failure_does_not_warn(caplog):
 from autourgos_openaichat import OpenAIChatModelAllProvidersFailedError
 
 
-def make_llm_with_fallback(fallback_models=("backup-model",), **kwargs):
+def make_llm_with_fallback(fallback_models=("backup-model",), fallback_pricing=None, **kwargs):
     """Construct an OpenAIChatModel with a mocked primary and mocked fallback clients."""
+    fallback_pricing = fallback_pricing or {}
     llm = OpenAIChatModel(
         model="gpt-4o",
         api_key="sk-test",
-        fallback_providers=[{"model": m, "api_key": "sk-backup"} for m in fallback_models],
+        fallback_providers=[
+            {"model": m, "api_key": "sk-backup", **fallback_pricing} for m in fallback_models
+        ],
         **kwargs,
     )
     llm._client = MagicMock()
@@ -862,6 +865,42 @@ def test_fallback_used_when_primary_fails():
     result = llm.invoke("hi")
     assert result == "Berlin"
     assert llm.last_metadata["provider_used"] == "fallback[0]:backup-model"
+
+
+def test_fallback_metadata_reports_its_own_model_not_the_primarys():
+    """Regression: llm.last_metadata['model'] must reflect whichever provider
+    actually answered, not always the primary's model name."""
+    llm = make_llm_with_fallback(max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("Berlin")
+    llm.invoke("hi")
+    assert llm.last_metadata["model"] == "backup-model"
+
+
+def test_fallback_cost_uses_its_own_pricing_not_the_primarys():
+    """Regression: cost for a fallback response must come from that fallback
+    entry's own pricing, not the primary's (different model, different price)."""
+    llm = make_llm_with_fallback(
+        max_retries=1, input_pricing=1000, output_pricing=1000,
+        fallback_pricing={"input_pricing": 1.0, "output_pricing": 2.0},
+    )
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion(
+        "Berlin", usage=(10, 5, 15)
+    )
+    llm.invoke("hi")
+    expected = (10 / 1_000_000) * 1.0 + (5 / 1_000_000) * 2.0
+    assert llm.last_metadata["total_cost"] == pytest.approx(expected)
+
+
+def test_fallback_without_its_own_pricing_omits_cost():
+    """A fallback entry with no pricing of its own must not silently borrow
+    the primary's price for a different model — cost fields stay unset."""
+    llm = make_llm_with_fallback(max_retries=1, input_pricing=1000, output_pricing=1000)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("Berlin")
+    llm.invoke("hi")
+    assert "total_cost" not in llm.last_metadata
     sent_model = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs["model"]
     assert sent_model == "backup-model"
 
@@ -1226,12 +1265,15 @@ def test_ledger_records_redacted_categories(tmp_path):
 
 # ── 23. Shadow-mode dual dispatch ────────────────────────────────────────────
 
-def make_llm_with_shadow(shadow_models=("backup-model",), **kwargs):
+def make_llm_with_shadow(shadow_models=("backup-model",), shadow_pricing=None, **kwargs):
     """Construct an OpenAIChatModel with a mocked primary and mocked shadow clients."""
+    shadow_pricing = shadow_pricing or {}
     llm = OpenAIChatModel(
         model="gpt-4o",
         api_key="sk-test",
-        shadow_providers=[{"model": m, "api_key": "sk-shadow"} for m in shadow_models],
+        shadow_providers=[
+            {"model": m, "api_key": "sk-shadow", **shadow_pricing} for m in shadow_models
+        ],
         **kwargs,
     )
     llm._client = MagicMock()
@@ -1254,6 +1296,10 @@ def test_shadow_disabled_by_default():
 
 
 def test_shadow_dispatch_returns_primary_and_records_shadow():
+    # Primary has pricing configured; the shadow entry deliberately does not,
+    # to prove cost isn't silently computed with the primary's (wrong) price
+    # for a different model — see test_shadow_cost_uses_its_own_pricing below
+    # for the case where the shadow entry does set its own pricing.
     llm = make_llm_with_shadow(input_pricing=1000, output_pricing=1000)
     llm._client.chat.completions.create.return_value = make_completion("Paris")
     llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion("Paris")
@@ -1266,9 +1312,26 @@ def test_shadow_dispatch_returns_primary_and_records_shadow():
     assert shadow["response"] == "Paris"
     assert shadow["similarity"] == 1.0
     assert shadow["error"] is None
-    assert shadow["total_cost"] is not None
+    assert shadow["total_cost"] is None  # shadow entry has no pricing of its own
     sent_model = llm._shadow_sync_clients[0].chat.completions.create.call_args.kwargs["model"]
     assert sent_model == "backup-model"
+
+
+def test_shadow_cost_uses_its_own_pricing_not_the_primarys():
+    """A shadow provider's cost must come from its own pricing, not the primary's."""
+    llm = make_llm_with_shadow(
+        input_pricing=1000, output_pricing=1000,
+        shadow_pricing={"input_pricing": 1.0, "output_pricing": 2.0},
+    )
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion(
+        "Paris", usage=(10, 5, 15)
+    )
+
+    llm.invoke("What is the capital of France?")
+    shadow = llm.last_shadow_results[0]
+    expected = (10 / 1_000_000) * 1.0 + (5 / 1_000_000) * 2.0
+    assert shadow["total_cost"] == pytest.approx(expected)
 
 
 def test_shadow_low_similarity_for_different_text():
