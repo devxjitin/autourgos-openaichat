@@ -4,13 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-openaichat"
-version = "2.4.0"
+version = "2.4.1"
 description = "Autourgos LLM wrapper for the OpenAI Chat Completions API"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
 authors = [
     { name = "Jitin Kumar Sengar", email = "devxjitin@gmail.com" },
+]
+maintainers = [
+    {name = "Sonia"},
+    {name = "Vishwanil Suman"},
 ]
 keywords = [
     "autourgos", "openai", "llm", "chat", "completions",

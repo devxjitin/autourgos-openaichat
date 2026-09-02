@@ -54,7 +54,7 @@ try:
     from importlib.metadata import version as _v
     __version__ = _v("autourgos-openaichat")
 except Exception:
-    __version__ = "1.0.0"
+    __version__ = "2.4.1"
 
 __all__ = [
     # Main class
