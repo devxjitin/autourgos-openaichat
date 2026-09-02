@@ -131,6 +131,24 @@ class OpenAIChatModelAllProvidersFailedError(OpenAIChatModelAPIError):
         self.attempts = attempts
 
 
+class OpenAIChatModelDeadlineExceededError(OpenAIChatModelAPIError):
+    """
+    Raised when ``max_call_duration`` is set and the aggregate wall-clock
+    time for one logical call (across all retries and, if configured, every
+    fallback provider) has been exceeded.
+
+    Without an aggregate deadline, retries and fallback each get their own
+    full retry budget independently -- a synchronous caller can be left
+    waiting for up to roughly ``providers x max_retries x timeout`` (plus
+    backoff sleeps) before finally getting an answer or an error. This is
+    checked between attempts/providers, not by cancelling an in-flight HTTP
+    request already sent (that's still bounded by the per-request
+    ``timeout``) -- so total wall-clock time can slightly exceed
+    ``max_call_duration`` by up to one in-flight request's duration, but
+    never by a further full retry/fallback cycle.
+    """
+
+
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class OpenAIChatModel(BaseLLM):
@@ -191,6 +209,7 @@ class OpenAIChatModel(BaseLLM):
         max_retries: int = 3,
         timeout: Optional[float] = 60.0,
         backoff_factor: float = 0.5,
+        max_call_duration: Optional[float] = None,
         input_pricing: Optional[float] = None,
         output_pricing: Optional[float] = None,
         circuit_failure_threshold: int = 5,
@@ -228,8 +247,21 @@ class OpenAIChatModel(BaseLLM):
             structured_output: If True, invoke() returns a metadata dict instead of a string.
             streaming: If True, invoke()/ainvoke() internally stream and return the full text.
             max_retries: Number of retry attempts on transient API errors.
-            timeout: Request timeout in seconds.
+            timeout: Request timeout in seconds, per HTTP attempt.
             backoff_factor: Base multiplier for exponential back-off between retries.
+            max_call_duration: Optional aggregate wall-clock budget in seconds for one
+                logical invoke()/ainvoke()/etc. call, covering every retry attempt and
+                (if configured) every fallback provider. Without this, retries and
+                fallback each get their own full retry budget independently — worst
+                case, a call can take roughly providers x max_retries x timeout (plus
+                backoff sleeps) before finally returning or raising. When set, the
+                deadline is checked before each retry attempt and before moving to the
+                next fallback provider, raising OpenAIChatModelDeadlineExceededError
+                once exceeded — it does not cancel an in-flight HTTP request already
+                sent (that stays bounded by timeout=), so total wall-clock time can
+                exceed max_call_duration by up to one in-flight request's duration, but
+                never by a further full retry/fallback cycle. None (default) disables
+                this cap — retries and fallback behave exactly as before.
             input_pricing: USD per 1 million input tokens (for cost tracking).
             output_pricing: USD per 1 million output tokens (for cost tracking).
             circuit_failure_threshold: Consecutive failures before the circuit opens.
@@ -341,6 +373,7 @@ class OpenAIChatModel(BaseLLM):
         self.max_retries = max_retries
         self.timeout = timeout
         self.backoff_factor = backoff_factor
+        self.max_call_duration = max_call_duration
 
         if self.structured_output and self.streaming:
             raise OpenAIChatModelConfigError(
@@ -873,11 +906,36 @@ class OpenAIChatModel(BaseLLM):
             )
         return params
 
+    # ── Aggregate call deadline ──────────────────────────────────────────────
+    # Opt-in (max_call_duration=None disables this entirely): without it,
+    # retries and fallback providers each get their own full retry budget
+    # independently, with no cap on total wall-clock time for one logical
+    # call. Checked between attempts/providers only -- an in-flight HTTP
+    # request already sent is never cancelled, so it stays bounded by
+    # timeout= instead.
+
+    def _new_deadline(self) -> Optional[float]:
+        """Return an absolute perf_counter() deadline, or None if uncapped."""
+        if self.max_call_duration is None:
+            return None
+        return time.perf_counter() + self.max_call_duration
+
+    @staticmethod
+    def _raise_if_deadline_exceeded(deadline: Optional[float], label: str) -> None:
+        if deadline is not None and time.perf_counter() >= deadline:
+            raise OpenAIChatModelDeadlineExceededError(
+                f"[{label}] max_call_duration exceeded before this attempt/provider could "
+                f"be tried."
+            )
+
     # ── Raw API calls (single client, with retry/back-off) ──────────────────────
 
-    def _attempt_sync_create(self, client: Any, params: Dict[str, Any], label: str) -> Any:
+    def _attempt_sync_create(
+        self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
+    ) -> Any:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
+            self._raise_if_deadline_exceeded(deadline, label)
             try:
                 return client.chat.completions.create(**params)
             except Exception as exc:
@@ -896,9 +954,12 @@ class OpenAIChatModel(BaseLLM):
                 time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
         raise OpenAIChatModelAPIError(f"[{label}] Unexpected retry exhaustion") from last_exc
 
-    async def _attempt_async_create(self, client: Any, params: Dict[str, Any], label: str) -> Any:
+    async def _attempt_async_create(
+        self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
+    ) -> Any:
         last_exc: Optional[Exception] = None
         for attempt in range(1, self.max_retries + 1):
+            self._raise_if_deadline_exceeded(deadline, label)
             try:
                 return await client.chat.completions.create(**params)
             except Exception as exc:
@@ -918,10 +979,10 @@ class OpenAIChatModel(BaseLLM):
         raise OpenAIChatModelAPIError(f"[{label}] Unexpected async retry exhaustion") from last_exc
 
     def _create_raw(self, params: Dict[str, Any]) -> Any:
-        return self._attempt_sync_create(self._client, params, "primary")
+        return self._attempt_sync_create(self._client, params, "primary", self._new_deadline())
 
     async def _acreate_raw(self, params: Dict[str, Any]) -> Any:
-        return await self._attempt_async_create(self._async_client, params, "primary")
+        return await self._attempt_async_create(self._async_client, params, "primary", self._new_deadline())
 
     # ── Raw API calls across primary + fallback providers ───────────────────────
 
@@ -933,12 +994,19 @@ class OpenAIChatModel(BaseLLM):
         ``pricing`` describe whichever target actually answered, not always
         the primary, so callers can attribute metadata/cost correctly.
         """
+        deadline = self._new_deadline()
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._sync_targets():
+            self._raise_if_deadline_exceeded(deadline, label)
             attempt_params = dict(params)
             attempt_params["model"] = model_name
             try:
-                return self._attempt_sync_create(client, attempt_params, label), label, model_name, pricing
+                return (
+                    self._attempt_sync_create(client, attempt_params, label, deadline),
+                    label, model_name, pricing,
+                )
+            except OpenAIChatModelDeadlineExceededError:
+                raise
             except OpenAIChatModelAPIError as exc:
                 attempts.append((label, exc))
         if len(attempts) == 1:
@@ -951,12 +1019,19 @@ class OpenAIChatModel(BaseLLM):
 
     async def _acreate_across_providers(self, params: Dict[str, Any]) -> tuple:
         """Async counterpart of ``_create_across_providers()``. See its docstring for the return shape."""
+        deadline = self._new_deadline()
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._async_targets():
+            self._raise_if_deadline_exceeded(deadline, label)
             attempt_params = dict(params)
             attempt_params["model"] = model_name
             try:
-                return await self._attempt_async_create(client, attempt_params, label), label, model_name, pricing
+                return (
+                    await self._attempt_async_create(client, attempt_params, label, deadline),
+                    label, model_name, pricing,
+                )
+            except OpenAIChatModelDeadlineExceededError:
+                raise
             except OpenAIChatModelAPIError as exc:
                 attempts.append((label, exc))
         if len(attempts) == 1:
@@ -1002,12 +1077,15 @@ class OpenAIChatModel(BaseLLM):
         self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
     ) -> Iterator[str]:
         base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
+        deadline = self._new_deadline()
         attempts: List[Any] = []
         for label, model_name, client, _pricing in self._sync_targets():
+            self._raise_if_deadline_exceeded(deadline, label)
             params = dict(base_params)
             params["model"] = model_name
             last_exc: Optional[Exception] = None
             for attempt in range(1, self.max_retries + 1):
+                self._raise_if_deadline_exceeded(deadline, label)
                 emitted = False
                 try:
                     stream = client.chat.completions.create(**params)
@@ -1061,12 +1139,15 @@ class OpenAIChatModel(BaseLLM):
         self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
     ) -> AsyncIterator[str]:
         base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
+        deadline = self._new_deadline()
         attempts: List[Any] = []
         for label, model_name, client, _pricing in self._async_targets():
+            self._raise_if_deadline_exceeded(deadline, label)
             params = dict(base_params)
             params["model"] = model_name
             last_exc: Optional[Exception] = None
             for attempt in range(1, self.max_retries + 1):
+                self._raise_if_deadline_exceeded(deadline, label)
                 emitted = False
                 try:
                     stream = await client.chat.completions.create(**params)
@@ -1583,4 +1664,5 @@ __all__ = [
     "OpenAIChatModelConfigError",
     "OpenAIChatModelAllProvidersFailedError",
     "OpenAIChatModelValidationError",
+    "OpenAIChatModelDeadlineExceededError",
 ]

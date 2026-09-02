@@ -1081,6 +1081,64 @@ def test_stream_no_fallback_after_partial_emit():
     llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
 
 
+# ── 18b. Aggregate call deadline (max_call_duration) ─────────────────────────
+
+from autourgos_openaichat import OpenAIChatModelDeadlineExceededError
+
+
+def test_max_call_duration_none_by_default_no_cap():
+    llm = make_llm()
+    assert llm.max_call_duration is None
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    assert llm.invoke("hi") == "Paris"
+
+
+def test_max_call_duration_exceeded_blocks_before_any_attempt():
+    llm = make_llm(max_call_duration=0.0)
+    with pytest.raises(OpenAIChatModelDeadlineExceededError):
+        llm.invoke("hi")
+    llm._client.chat.completions.create.assert_not_called()
+
+
+def test_max_call_duration_stops_before_trying_fallback():
+    """
+    Regression: without an aggregate deadline, retries and fallback each get
+    their own full retry budget independently. With max_call_duration set,
+    once it's exceeded partway through the primary's retries, the fallback
+    provider must never even be tried -- the call fails fast with
+    OpenAIChatModelDeadlineExceededError instead of quietly moving on to
+    burn through the fallback's retry budget too.
+    """
+    llm = make_llm_with_fallback(max_retries=3, backoff_factor=1.0, max_call_duration=0.05)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary flaky")
+
+    with pytest.raises(OpenAIChatModelDeadlineExceededError):
+        llm.invoke("hi")
+
+    # Primary was attempted at least once before the ~1s backoff sleep pushed
+    # elapsed time past the 0.05s deadline on the next retry-loop check.
+    assert llm._client.chat.completions.create.call_count >= 1
+    llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
+
+
+def test_max_call_duration_applies_to_stream():
+    llm = make_llm(max_call_duration=0.0)
+    with pytest.raises(OpenAIChatModelDeadlineExceededError):
+        list(llm.stream("hi"))
+    llm._client.chat.completions.create.assert_not_called()
+
+
+def test_max_call_duration_applies_to_ainvoke():
+    llm = make_llm(max_retries=3, backoff_factor=1.0, max_call_duration=0.05)
+    llm._async_client.chat.completions.create = AsyncMock(side_effect=RuntimeError("boom"))
+
+    async def run():
+        return await llm.ainvoke("hi")
+
+    with pytest.raises(OpenAIChatModelDeadlineExceededError):
+        asyncio.run(run())
+
+
 # ── 19. Validated structured output (invoke_structured) ─────────────────────
 
 from autourgos_openaichat import OpenAIChatModelValidationError
