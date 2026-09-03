@@ -8,31 +8,38 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
-from .ledger import close_ledger, open_ledger, write_ledger_entry, write_shadow_ledger_entry
-from .llm import BaseLLM, FunctionCall, NonTransientError, ToolCallResponse
-from .redaction import compile_patterns, redact_value, restore_text
-from .shadow import compute_similarity
+from .ledger import close_ledger
+from .llm import (
+    _NON_RETRYABLE_STATUS_CODES,
+    BaseProviderLLM,
+    FunctionCall,
+    NonTransientError,
+    ToolCallResponse,
+)
+from .redaction import redact_value, restore_text
 from .model_runtime import (
     build_structured_output,
     coerce_prompt_variable,
-    configure_runtime_environment,
     extract_template_fields,
+    extract_refusal_from_response,
     extract_text_from_response,
     extract_usage_metadata,
     track_latency,
 )
 from .core import (
+    apply_max_tokens_param,
     build_chat_completion_create_params,
     build_multimodal_messages,
     build_response_format,
     configure_async_openai_client,
     configure_openai_client,
+    extract_refusal_delta_from_event,
     extract_text_delta_from_event,
+    extract_usage_bearing_event,
+    strip_unsupported_sampling_params,
     load_openai_module,
     logger,
     normalize_model_name,
@@ -42,15 +49,7 @@ from .core import (
     resolve_base_url,
 )
 
-configure_runtime_environment()
 _OPENAI_AVAILABLE, openai_cls, async_openai_cls, _OPENAI_IMPORT_ERROR = load_openai_module()
-
-# Client errors that will never succeed on retry — fail fast instead of
-# burning the retry budget and adding latency.
-_NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404, 422}
-
-# Sentinel distinguishing "no override passed" from "override explicitly None".
-_UNSET = object()
 
 
 # ── Custom exceptions ─────────────────────────────────────────────────────────
@@ -96,6 +95,25 @@ class OpenAIChatModelValidationError(OpenAIChatModelResponseError):
         super().__init__(message)
         self.raw_text = raw_text
         self.validation_error = validation_error
+
+
+class OpenAIChatModelRefusalError(OpenAIChatModelResponseError, NonTransientError):
+    """
+    Raised when the model declines to answer (Chat Completions' dedicated
+    ``refusal`` field was populated instead of ``content``), streaming or
+    non-streaming. ``.refusal_text`` holds the model's refusal message.
+
+    This is the provider working as designed, not a failure -- mixes in
+    NonTransientError so it doesn't count toward the circuit breaker's
+    consecutive-failure threshold, and callers must not fall through to a
+    fallback provider for it (see call sites): a refusal is a valid, final
+    answer from a working provider, so retrying a different model for it
+    would just waste an extra API call.
+    """
+
+    def __init__(self, message: str, *, refusal_text: str) -> None:
+        super().__init__(message)
+        self.refusal_text = refusal_text
 
 
 class OpenAIChatModelRedactionBlockedError(OpenAIChatModelError, NonTransientError):
@@ -151,7 +169,7 @@ class OpenAIChatModelDeadlineExceededError(OpenAIChatModelAPIError):
 
 # ── Main class ────────────────────────────────────────────────────────────────
 
-class OpenAIChatModel(BaseLLM):
+class OpenAIChatModel(BaseProviderLLM):
     """
     LLM wrapper for the OpenAI Chat Completions API.
 
@@ -187,7 +205,61 @@ class OpenAIChatModel(BaseLLM):
             print(response.tool_calls)
     """
 
+    _config_error_cls = OpenAIChatModelConfigError
+    _deadline_exceeded_cls = OpenAIChatModelDeadlineExceededError
+    _api_error_cls = OpenAIChatModelAPIError
+    _all_providers_failed_cls = OpenAIChatModelAllProvidersFailedError
+    _api_name = "Chat Completions"
     supports_tool_calling: bool = True
+
+    def _do_sync_create(self, client: Any, params: Dict[str, Any]) -> Any:
+        return client.chat.completions.create(**params)
+
+    async def _do_async_create(self, client: Any, params: Dict[str, Any]) -> Any:
+        return await client.chat.completions.create(**params)
+
+    def _apply_per_target_param_guards(self, params: Dict[str, Any], model_name: str) -> None:
+        apply_max_tokens_param(params, model_name)
+        strip_unsupported_sampling_params(params, model_name)
+
+    _logger = logger
+
+    def _extract_response_text(self, raw: Any) -> Optional[str]:
+        return extract_text_from_response(raw)
+
+    def _extract_usage(self, raw: Any) -> Dict[str, Optional[int]]:
+        return extract_usage_metadata(raw)
+
+    def _build_base_params_for_call(
+        self, prompt_input: Any, *, stream: bool, overrides: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        return self._build_base_params(messages=prompt_input, stream=stream, overrides=overrides)
+
+    _response_error_cls = OpenAIChatModelResponseError
+    _refusal_error_cls = OpenAIChatModelRefusalError
+
+    def _extract_text_delta(self, event: Any) -> Optional[str]:
+        return extract_text_delta_from_event(event)
+
+    def _extract_usage_event(self, event: Any) -> Optional[Any]:
+        return extract_usage_bearing_event(event)
+
+    def _extract_refusal_delta(self, event: Any) -> Optional[str]:
+        return extract_refusal_delta_from_event(event)
+
+    def _invoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
+        return self._invoke_non_stream(messages=prepared_input, overrides=overrides)
+
+    async def _ainvoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
+        return await self._ainvoke_non_stream(messages=prepared_input, overrides=overrides)
+
+    _validation_error_cls = OpenAIChatModelValidationError
+    _create_input_key = "messages"
+    _create_missing_input_message = "input_data (messages) is required"
+
+    def _apply_create_param_guards(self, params: Dict[str, Any], model_name: str) -> None:
+        apply_max_tokens_param(params, model_name)
+        strip_unsupported_sampling_params(params, model_name)
 
     def __init__(
         self,
@@ -228,6 +300,7 @@ class OpenAIChatModel(BaseLLM):
         shadow_providers: Optional[List[Dict[str, Any]]] = None,
         on_shadow_result: Optional[Callable[[Dict[str, Any]], None]] = None,
         extra_body: Optional[Dict[str, Any]] = None,
+        store: Optional[bool] = None,
     ) -> None:
         """
         Args:
@@ -246,7 +319,9 @@ class OpenAIChatModel(BaseLLM):
             response_mime_type: e.g. "application/json" to enable json_object mode.
             structured_output: If True, invoke() returns a metadata dict instead of a string.
             streaming: If True, invoke()/ainvoke() internally stream and return the full text.
-            max_retries: Number of retry attempts on transient API errors.
+            max_retries: Total attempts per provider on transient API errors, including
+                the first try (e.g. 3 means 1 initial attempt + up to 2 retries). Must
+                be >= 1 -- there is no "0 attempts" mode.
             timeout: Request timeout in seconds, per HTTP attempt.
             backoff_factor: Base multiplier for exponential back-off between retries.
             max_call_duration: Optional aggregate wall-clock budget in seconds for one
@@ -343,6 +418,10 @@ class OpenAIChatModel(BaseLLM):
                 guided_choice for constrained decoding, or llama.cpp's grammar. Not
                 validated or interpreted by this library, and not portable across
                 providers that don't recognize the same keys. None (default) adds nothing.
+            store: Whether OpenAI should persist the response server-side (retrievable by
+                ID, used for evals/distillation). None (default) omits the param entirely,
+                so the API's own default applies. A per-call invoke(store=...)/etc. override
+                takes precedence over this constructor default for that one call.
         """
         super().__init__(
             input_pricing=input_pricing,
@@ -370,7 +449,6 @@ class OpenAIChatModel(BaseLLM):
         self.response_mime_type = response_mime_type
         self.structured_output = structured_output
         self.streaming = streaming
-        self.max_retries = max_retries
         self.timeout = timeout
         self.backoff_factor = backoff_factor
         self.max_call_duration = max_call_duration
@@ -380,63 +458,23 @@ class OpenAIChatModel(BaseLLM):
                 "structured_output=True is incompatible with streaming=True."
             )
 
-        for i, entry in enumerate(fallback_providers or []):
-            if not entry.get("model"):
-                raise OpenAIChatModelConfigError(
-                    f"fallback_providers[{i}] is missing required key 'model'."
-                )
-        self.fallback_providers: List[Dict[str, Any]] = list(fallback_providers or [])
-        self._fallback_sync_clients: Dict[int, Any] = {}
-        self._fallback_async_clients: Dict[int, Any] = {}
-
-        self.ledger_path = ledger_path
-        self.ledger_store_content = ledger_store_content
-        self._ledger_conn = open_ledger(ledger_path) if ledger_path else None
-        self._ledger_lock = threading.Lock()
-
-        if redact_mode not in ("mask", "block"):
-            raise OpenAIChatModelConfigError(
-                f"redact_mode must be 'mask' or 'block', got {redact_mode!r}."
-            )
-        self.redact_pii = redact_pii
-        self.redact_mode = redact_mode
-        self.last_redacted_categories: List[str] = []
-        self._last_redaction_map: Dict[str, str] = {}
-        try:
-            self._redact_patterns = (
-                compile_patterns(
-                    redact_categories, redact_custom_patterns, redact_custom_terms, redact_patterns_file
-                )
-                if redact_pii else {}
-            )
-        except ValueError as exc:
-            raise OpenAIChatModelConfigError(str(exc)) from exc
-
-        if redact_restore_in_response:
-            if not redact_pii:
-                raise OpenAIChatModelConfigError(
-                    "redact_restore_in_response requires redact_pii=True."
-                )
-            if redact_mode != "mask":
-                raise OpenAIChatModelConfigError(
-                    "redact_restore_in_response requires redact_mode='mask' — with "
-                    "redact_mode='block' the call never reaches the model, so there is "
-                    "nothing to restore."
-                )
-        self.redact_restore_in_response = redact_restore_in_response
-
-        for i, entry in enumerate(shadow_providers or []):
-            if not entry.get("model"):
-                raise OpenAIChatModelConfigError(
-                    f"shadow_providers[{i}] is missing required key 'model'."
-                )
-        self.shadow_providers: List[Dict[str, Any]] = list(shadow_providers or [])
-        self.on_shadow_result = on_shadow_result
-        self.last_shadow_results: List[Dict[str, Any]] = []
-        self._shadow_sync_clients: Dict[int, Any] = {}
-        self._shadow_async_clients: Dict[int, Any] = {}
-
-        self.extra_body = extra_body
+        self._init_provider_common(
+            max_retries=max_retries,
+            fallback_providers=fallback_providers,
+            ledger_path=ledger_path,
+            ledger_store_content=ledger_store_content,
+            redact_pii=redact_pii,
+            redact_mode=redact_mode,
+            redact_categories=redact_categories,
+            redact_custom_patterns=redact_custom_patterns,
+            redact_custom_terms=redact_custom_terms,
+            redact_patterns_file=redact_patterns_file,
+            redact_restore_in_response=redact_restore_in_response,
+            shadow_providers=shadow_providers,
+            on_shadow_result=on_shadow_result,
+            extra_body=extra_body,
+            store=store,
+        )
 
         self._model_name = normalize_model_name(self.model)
         self._client: Any = None
@@ -498,35 +536,6 @@ class OpenAIChatModel(BaseLLM):
             )
         return self._fallback_async_clients[index]
 
-    def _sync_targets(self) -> Iterator[tuple]:
-        """
-        Yield (label, model_name, client, pricing) for the primary, then each
-        fallback in order. ``pricing`` is (input_pricing, output_pricing) —
-        the primary's constructor-level pricing, or a fallback entry's own
-        "input_pricing"/"output_pricing" keys (None if it doesn't set them,
-        never inherited from the primary — a fallback is typically a
-        different model with a different price).
-        """
-        yield "primary", self._model_name, self._client, (self.input_pricing, self.output_pricing)
-        for i, cfg in enumerate(self.fallback_providers):
-            yield (
-                f"fallback[{i}]:{cfg['model']}",
-                normalize_model_name(cfg["model"]),
-                self._get_fallback_sync_client(i),
-                (cfg.get("input_pricing"), cfg.get("output_pricing")),
-            )
-
-    def _async_targets(self) -> Iterator[tuple]:
-        """Async counterpart of ``_sync_targets()``. See its docstring for ``pricing``."""
-        yield "primary", self._model_name, self._async_client, (self.input_pricing, self.output_pricing)
-        for i, cfg in enumerate(self.fallback_providers):
-            yield (
-                f"fallback[{i}]:{cfg['model']}",
-                normalize_model_name(cfg["model"]),
-                self._get_fallback_async_client(i),
-                (cfg.get("input_pricing"), cfg.get("output_pricing")),
-            )
-
     def _get_shadow_sync_client(self, index: int) -> Any:
         """Lazily create and cache the sync client for shadow_providers[index]."""
         if index not in self._shadow_sync_clients:
@@ -554,31 +563,6 @@ class OpenAIChatModel(BaseLLM):
                 timeout=self.timeout,
             )
         return self._shadow_async_clients[index]
-
-    def _shadow_targets(self) -> Iterator[tuple]:
-        """
-        Yield (label, model_name, client, pricing) for each configured shadow
-        provider. ``pricing`` is that shadow entry's own "input_pricing"/
-        "output_pricing" keys (None if unset) — never the primary's, since a
-        shadow provider is typically a different model with a different price.
-        """
-        for i, cfg in enumerate(self.shadow_providers):
-            yield (
-                f"shadow[{i}]:{cfg['model']}",
-                normalize_model_name(cfg["model"]),
-                self._get_shadow_sync_client(i),
-                (cfg.get("input_pricing"), cfg.get("output_pricing")),
-            )
-
-    def _async_shadow_targets(self) -> Iterator[tuple]:
-        """Async counterpart of ``_shadow_targets()``. See its docstring for ``pricing``."""
-        for i, cfg in enumerate(self.shadow_providers):
-            yield (
-                f"shadow[{i}]:{cfg['model']}",
-                normalize_model_name(cfg["model"]),
-                self._get_shadow_async_client(i),
-                (cfg.get("input_pricing"), cfg.get("output_pricing")),
-            )
 
     # ── Context managers ──────────────────────────────────────────────────────
 
@@ -638,188 +622,36 @@ class OpenAIChatModel(BaseLLM):
         close_ledger(self._ledger_conn)
         self._ledger_conn = None
 
-    # ── Call ledger ───────────────────────────────────────────────────────────
-
-    def _log_to_ledger(
-        self,
-        *,
-        call_type: str,
-        prompt: Any,
-        metadata: Dict[str, Any],
-        response_override: Any = _UNSET,
-    ) -> None:
-        if self._ledger_conn is None:
-            return
-        prompt_text = str(prompt) if (self.ledger_store_content and prompt is not None) else None
-        raw_response = metadata.get("response") if response_override is _UNSET else response_override
-        response_text = raw_response if self.ledger_store_content else None
-        write_ledger_entry(
-            self._ledger_conn,
-            self._ledger_lock,
-            model=metadata.get("model"),
-            provider_used=metadata.get("provider_used"),
-            call_type=call_type,
-            prompt=prompt_text,
-            response=response_text,
-            metadata=metadata,
-            redacted_categories=self.last_redacted_categories,
-        )
-
-    # ── Shadow-mode dual dispatch ────────────────────────────────────────────
-    # Runs concurrently with (not after) the primary call. invoke()/ainvoke()
-    # always return the primary's result; shadow results are observation-only.
-
-    def _build_shadow_result(
-        self,
-        label: str,
-        response_text: Optional[str],
-        raw_response: Any,
-        primary_text: Optional[str],
-        latency_ms: float,
-        error: Optional[str],
-        pricing: "tuple[Optional[float], Optional[float]]",
-    ) -> Dict[str, Any]:
-        if error is not None:
-            return {
-                "provider_used": label, "response": None, "similarity": None,
-                "input_tokens": None, "output_tokens": None, "total_cost": None,
-                "latency_ms": latency_ms, "error": error,
-            }
-        usage = extract_usage_metadata(raw_response)
-        input_pricing, output_pricing = pricing
-        total_cost = None
-        if (
-            input_pricing is not None and output_pricing is not None
-            and usage["input_tokens"] is not None and usage["output_tokens"] is not None
-        ):
-            total_cost = (
-                (usage["input_tokens"] / 1_000_000) * input_pricing
-                + (usage["output_tokens"] / 1_000_000) * output_pricing
-            )
-        return {
-            "provider_used": label,
-            "response": response_text,
-            "similarity": compute_similarity(primary_text, response_text),
-            "input_tokens": usage["input_tokens"],
-            "output_tokens": usage["output_tokens"],
-            "total_cost": total_cost,
-            "latency_ms": latency_ms,
-            "error": None,
-        }
-
-    def _log_shadow_to_ledger(self, result: Dict[str, Any]) -> None:
-        if self._ledger_conn is None:
-            return
-        write_shadow_ledger_entry(
-            self._ledger_conn,
-            self._ledger_lock,
-            provider_used=result["provider_used"],
-            response=result["response"] if self.ledger_store_content else None,
-            similarity=result["similarity"],
-            input_tokens=result["input_tokens"],
-            output_tokens=result["output_tokens"],
-            total_cost=result["total_cost"],
-            latency_ms=result["latency_ms"],
-            error=result["error"],
-        )
-
-    def _finalize_shadow_results(self, raw_results: List[tuple], primary_text: Optional[str]) -> None:
-        results = []
-        for label, text, raw, latency_ms, error, pricing in raw_results:
-            result = self._build_shadow_result(label, text, raw, primary_text, latency_ms, error, pricing)
-            results.append(result)
-            self._log_shadow_to_ledger(result)
-            if self.on_shadow_result is not None:
-                try:
-                    self.on_shadow_result(result)
-                except Exception:
-                    logger.warning("on_shadow_result callback raised", exc_info=True)
-        self.last_shadow_results = results
-
-    def _execute_shadow_attempt_sync(
-        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]], pricing: tuple
-    ) -> tuple:
-        params = dict(self._build_base_params(messages=messages, stream=False))
-        params["model"] = model_name
-        start = time.perf_counter()
-        try:
-            raw = client.chat.completions.create(**params)
-            text = extract_text_from_response(raw)
-            latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, text, raw, latency_ms, None, pricing
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}", pricing
-
-    async def _execute_shadow_attempt_async(
-        self, label: str, model_name: str, client: Any, messages: List[Dict[str, Any]], pricing: tuple
-    ) -> tuple:
-        params = dict(self._build_base_params(messages=messages, stream=False))
-        params["model"] = model_name
-        start = time.perf_counter()
-        try:
-            raw = await client.chat.completions.create(**params)
-            text = extract_text_from_response(raw)
-            latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, text, raw, latency_ms, None, pricing
-        except Exception as exc:
-            latency_ms = round((time.perf_counter() - start) * 1000, 2)
-            return label, None, None, latency_ms, f"{type(exc).__name__}: {exc}", pricing
-
-    def _dispatch_shadow_sync(self, messages: List[Dict[str, Any]], primary_text: Optional[str]) -> None:
-        if not self.shadow_providers:
-            self.last_shadow_results = []
-            return
-        targets = list(self._shadow_targets())
-        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
-            futures = [
-                executor.submit(self._execute_shadow_attempt_sync, label, model_name, client, messages, pricing)
-                for label, model_name, client, pricing in targets
-            ]
-            raw_results = [f.result() for f in futures]
-        self._finalize_shadow_results(raw_results, primary_text)
-
-    async def _dispatch_shadow_async(self, messages: List[Dict[str, Any]], primary_text: Optional[str]) -> None:
-        if not self.shadow_providers:
-            self.last_shadow_results = []
-            return
-        targets = list(self._async_shadow_targets())
-        raw_results = list(await asyncio.gather(*[
-            self._execute_shadow_attempt_async(label, model_name, client, messages, pricing)
-            for label, model_name, client, pricing in targets
-        ]))
-        self._finalize_shadow_results(raw_results, primary_text)
-
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _resolve_prompt(
-        self,
-        prompt: Any,
-        prompt_variables: Optional[Dict[str, Any]],
-        files: Optional[Any] = None,
-    ) -> Any:
-        """Resolve prompt or render from template, then apply redaction if enabled."""
-        resolved = self._resolve_prompt_raw(prompt, prompt_variables, files)
-        return self._apply_redaction(resolved)
+    def _apply_redaction(self, resolved: Any) -> "tuple[Any, List[str], Dict[str, str]]":
+        """
+        Redact ``resolved`` if enabled and return (redacted_value,
+        found_categories, mapping) as a call-local tuple.
 
-    def _apply_redaction(self, resolved: Any) -> Any:
-        self.last_redacted_categories = []
-        self._last_redaction_map = {}
+        Deliberately does NOT write to ``self.last_redacted_categories``/
+        ``self._last_redaction_map`` here -- those are best-effort
+        convenience attributes set by the caller *after* its full call
+        completes (mirroring ``self.last_metadata``), never used internally
+        for restore_text()/ledger logging. Writing them here made every
+        concurrent call on a shared instance race to overwrite the same
+        instance attributes, so a slower call could restore/log using a
+        faster, unrelated call's mapping/categories -- including splicing
+        another caller's secret into this caller's returned text.
+        """
         if not self.redact_pii:
-            return resolved
+            return resolved, [], {}
         redacted, found, mapping = redact_value(
             resolved, self._redact_patterns, track_mapping=self.redact_restore_in_response
         )
-        self.last_redacted_categories = found
-        self._last_redaction_map = mapping
         if not found:
-            return resolved
+            return resolved, [], {}
         if self.redact_mode == "block":
             raise OpenAIChatModelRedactionBlockedError(
                 f"Prompt blocked: matched redaction categories {found}.",
                 categories_found=found,
             )
-        return redacted
+        return redacted, found, mapping
 
     def _resolve_prompt_raw(
         self,
@@ -864,7 +696,11 @@ class OpenAIChatModel(BaseLLM):
     ) -> List[Dict[str, Any]]:
         """Build the full messages list including optional system instruction."""
         messages: List[Dict[str, Any]] = []
-        if self.system_prompt:
+        prompt_already_has_system_message = isinstance(prompt, list) and any(
+            (m.get("role") if isinstance(m, dict) else getattr(m, "role", None)) in ("system", "developer")
+            for m in prompt
+        )
+        if self.system_prompt and not prompt_already_has_system_message:
             messages.append({"role": "system", "content": self.system_prompt})
         if isinstance(prompt, list):
             messages.extend(prompt)
@@ -896,6 +732,8 @@ class OpenAIChatModel(BaseLLM):
         )
         if self.extra_body:
             params["extra_body"] = dict(self.extra_body)
+        if self.store is not None:
+            params["store"] = self.store
         if overrides:
             # "messages"/"model"/"stream" stay structurally managed (per-target
             # model swap on fallback, non-stream vs. stream dispatch) — a caller
@@ -914,134 +752,6 @@ class OpenAIChatModel(BaseLLM):
     # request already sent is never cancelled, so it stays bounded by
     # timeout= instead.
 
-    def _new_deadline(self) -> Optional[float]:
-        """Return an absolute perf_counter() deadline, or None if uncapped."""
-        if self.max_call_duration is None:
-            return None
-        return time.perf_counter() + self.max_call_duration
-
-    @staticmethod
-    def _raise_if_deadline_exceeded(deadline: Optional[float], label: str) -> None:
-        if deadline is not None and time.perf_counter() >= deadline:
-            raise OpenAIChatModelDeadlineExceededError(
-                f"[{label}] max_call_duration exceeded before this attempt/provider could "
-                f"be tried."
-            )
-
-    # ── Raw API calls (single client, with retry/back-off) ──────────────────────
-
-    def _attempt_sync_create(
-        self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
-    ) -> Any:
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            self._raise_if_deadline_exceeded(deadline, label)
-            try:
-                return client.chat.completions.create(**params)
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise OpenAIChatModelAPIError(
-                        f"[{label}] Chat Completions request failed with non-retryable status "
-                        f"{status_code}. Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if attempt == self.max_retries:
-                    raise OpenAIChatModelAPIError(
-                        f"[{label}] Chat Completions request failed after {self.max_retries} "
-                        f"attempts. Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError(f"[{label}] Unexpected retry exhaustion") from last_exc
-
-    async def _attempt_async_create(
-        self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
-    ) -> Any:
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
-            self._raise_if_deadline_exceeded(deadline, label)
-            try:
-                return await client.chat.completions.create(**params)
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise OpenAIChatModelAPIError(
-                        f"[{label}] Async Chat Completions request failed with non-retryable "
-                        f"status {status_code}. Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if attempt == self.max_retries:
-                    raise OpenAIChatModelAPIError(
-                        f"[{label}] Async Chat Completions request failed after "
-                        f"{self.max_retries} attempts. Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise OpenAIChatModelAPIError(f"[{label}] Unexpected async retry exhaustion") from last_exc
-
-    def _create_raw(self, params: Dict[str, Any]) -> Any:
-        return self._attempt_sync_create(self._client, params, "primary", self._new_deadline())
-
-    async def _acreate_raw(self, params: Dict[str, Any]) -> Any:
-        return await self._attempt_async_create(self._async_client, params, "primary", self._new_deadline())
-
-    # ── Raw API calls across primary + fallback providers ───────────────────────
-
-    def _create_across_providers(self, params: Dict[str, Any]) -> tuple:
-        """
-        Try the primary, then each fallback provider in order.
-
-        Returns (raw, label, model_name, pricing) — ``model_name`` and
-        ``pricing`` describe whichever target actually answered, not always
-        the primary, so callers can attribute metadata/cost correctly.
-        """
-        deadline = self._new_deadline()
-        attempts: List[Any] = []
-        for label, model_name, client, pricing in self._sync_targets():
-            self._raise_if_deadline_exceeded(deadline, label)
-            attempt_params = dict(params)
-            attempt_params["model"] = model_name
-            try:
-                return (
-                    self._attempt_sync_create(client, attempt_params, label, deadline),
-                    label, model_name, pricing,
-                )
-            except OpenAIChatModelDeadlineExceededError:
-                raise
-            except OpenAIChatModelAPIError as exc:
-                attempts.append((label, exc))
-        if len(attempts) == 1:
-            raise attempts[0][1]
-        raise OpenAIChatModelAllProvidersFailedError(
-            f"All {len(attempts)} provider(s) failed: "
-            + "; ".join(f"{label}: {exc}" for label, exc in attempts),
-            attempts=attempts,
-        )
-
-    async def _acreate_across_providers(self, params: Dict[str, Any]) -> tuple:
-        """Async counterpart of ``_create_across_providers()``. See its docstring for the return shape."""
-        deadline = self._new_deadline()
-        attempts: List[Any] = []
-        for label, model_name, client, pricing in self._async_targets():
-            self._raise_if_deadline_exceeded(deadline, label)
-            attempt_params = dict(params)
-            attempt_params["model"] = model_name
-            try:
-                return (
-                    await self._attempt_async_create(client, attempt_params, label, deadline),
-                    label, model_name, pricing,
-                )
-            except OpenAIChatModelDeadlineExceededError:
-                raise
-            except OpenAIChatModelAPIError as exc:
-                attempts.append((label, exc))
-        if len(attempts) == 1:
-            raise attempts[0][1]
-        raise OpenAIChatModelAllProvidersFailedError(
-            f"All {len(attempts)} provider(s) failed: "
-            + "; ".join(f"{label}: {exc}" for label, exc in attempts),
-            attempts=attempts,
-        )
-
     # ── Non-stream invocation ─────────────────────────────────────────────────
 
     def _invoke_non_stream(
@@ -1052,6 +762,12 @@ class OpenAIChatModel(BaseLLM):
         text = extract_text_from_response(resp)
         if text:
             return text, resp, provider_label, provider_model, provider_pricing
+        refusal = extract_refusal_from_response(resp)
+        if refusal:
+            raise OpenAIChatModelRefusalError(
+                f"[{provider_label}] Model declined to answer: {refusal}",
+                refusal_text=refusal,
+            )
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the Chat Completions response."
         )
@@ -1064,137 +780,14 @@ class OpenAIChatModel(BaseLLM):
         text = extract_text_from_response(resp)
         if text:
             return text, resp, provider_label, provider_model, provider_pricing
+        refusal = extract_refusal_from_response(resp)
+        if refusal:
+            raise OpenAIChatModelRefusalError(
+                f"[{provider_label}] Model declined to answer: {refusal}",
+                refusal_text=refusal,
+            )
         raise OpenAIChatModelResponseError(
             "No text could be extracted from the async Chat Completions response."
-        )
-
-    # ── Streaming ─────────────────────────────────────────────────────────────
-    # Fallback only kicks in if a target fails before it has emitted any chunk —
-    # once partial text has reached the caller, switching providers mid-stream
-    # would duplicate or corrupt output, so the error is raised as-is instead.
-
-    def _invoke_stream_mode(
-        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
-    ) -> Iterator[str]:
-        base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
-        deadline = self._new_deadline()
-        attempts: List[Any] = []
-        for label, model_name, client, _pricing in self._sync_targets():
-            self._raise_if_deadline_exceeded(deadline, label)
-            params = dict(base_params)
-            params["model"] = model_name
-            last_exc: Optional[Exception] = None
-            for attempt in range(1, self.max_retries + 1):
-                self._raise_if_deadline_exceeded(deadline, label)
-                emitted = False
-                try:
-                    stream = client.chat.completions.create(**params)
-                    for event in stream:
-                        delta = extract_text_delta_from_event(event)
-                        if delta:
-                            emitted = True
-                            yield delta
-                    if emitted:
-                        return
-                    raise OpenAIChatModelResponseError(f"[{label}] No text deltas in streaming response")
-                except OpenAIChatModelResponseError as exc:
-                    if emitted:
-                        raise
-                    last_exc = exc
-                    break
-                except Exception as exc:
-                    status_code = getattr(exc, "status_code", None)
-                    if emitted:
-                        raise OpenAIChatModelAPIError(
-                            f"[{label}] Streaming failed mid-response after emitting output: "
-                            f"{type(exc).__name__}: {exc}"
-                        ) from exc
-                    if status_code in _NON_RETRYABLE_STATUS_CODES:
-                        last_exc = OpenAIChatModelAPIError(
-                            f"[{label}] Streaming failed with non-retryable status {status_code}. "
-                            f"Error: {type(exc).__name__}: {exc}"
-                        )
-                        last_exc.__cause__ = exc
-                        break
-                    if attempt == self.max_retries:
-                        last_exc = OpenAIChatModelAPIError(
-                            f"[{label}] Streaming failed after {attempt} attempt(s). "
-                            f"Last error: {type(exc).__name__}: {exc}"
-                        )
-                        last_exc.__cause__ = exc
-                        break
-                    time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-                    continue
-                break
-            attempts.append((label, last_exc))
-        if len(attempts) == 1:
-            raise attempts[0][1]
-        raise OpenAIChatModelAllProvidersFailedError(
-            f"Streaming failed on all {len(attempts)} provider(s): "
-            + "; ".join(f"{lbl}: {exc}" for lbl, exc in attempts),
-            attempts=attempts,
-        )
-
-    async def _ainvoke_stream_mode(
-        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
-    ) -> AsyncIterator[str]:
-        base_params = self._build_base_params(messages=messages, stream=True, overrides=overrides)
-        deadline = self._new_deadline()
-        attempts: List[Any] = []
-        for label, model_name, client, _pricing in self._async_targets():
-            self._raise_if_deadline_exceeded(deadline, label)
-            params = dict(base_params)
-            params["model"] = model_name
-            last_exc: Optional[Exception] = None
-            for attempt in range(1, self.max_retries + 1):
-                self._raise_if_deadline_exceeded(deadline, label)
-                emitted = False
-                try:
-                    stream = await client.chat.completions.create(**params)
-                    async for event in stream:
-                        delta = extract_text_delta_from_event(event)
-                        if delta:
-                            emitted = True
-                            yield delta
-                    if emitted:
-                        return
-                    raise OpenAIChatModelResponseError(f"[{label}] No text deltas in async streaming response")
-                except OpenAIChatModelResponseError as exc:
-                    if emitted:
-                        raise
-                    last_exc = exc
-                    break
-                except Exception as exc:
-                    status_code = getattr(exc, "status_code", None)
-                    if emitted:
-                        raise OpenAIChatModelAPIError(
-                            f"[{label}] Async streaming failed mid-response after emitting output: "
-                            f"{type(exc).__name__}: {exc}"
-                        ) from exc
-                    if status_code in _NON_RETRYABLE_STATUS_CODES:
-                        last_exc = OpenAIChatModelAPIError(
-                            f"[{label}] Async streaming failed with non-retryable status {status_code}. "
-                            f"Error: {type(exc).__name__}: {exc}"
-                        )
-                        last_exc.__cause__ = exc
-                        break
-                    if attempt == self.max_retries:
-                        last_exc = OpenAIChatModelAPIError(
-                            f"[{label}] Async streaming failed after {attempt} attempt(s). "
-                            f"Last error: {type(exc).__name__}: {exc}"
-                        )
-                        last_exc.__cause__ = exc
-                        break
-                    await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-                    continue
-                break
-            attempts.append((label, last_exc))
-        if len(attempts) == 1:
-            raise attempts[0][1]
-        raise OpenAIChatModelAllProvidersFailedError(
-            f"Async streaming failed on all {len(attempts)} provider(s): "
-            + "; ".join(f"{lbl}: {exc}" for lbl, exc in attempts),
-            attempts=attempts,
         )
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -1227,41 +820,16 @@ class OpenAIChatModel(BaseLLM):
             Generated text string, or a metadata dict if structured_output=True.
         """
         self._check_budget()
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-
-        if self.streaming:
-            return "".join(self._invoke_stream_mode(messages=messages, overrides=overrides))
-
-        with self._budget_admission():
-            with track_latency() as timing:
-                response_text, raw_response, provider_label, provider_model, provider_pricing = self._invoke_non_stream(
-                    messages=messages, overrides=overrides
-                )
-
-            masked_response_text = response_text
-            if self.redact_restore_in_response:
-                response_text = restore_text(response_text, self._last_redaction_map)
-
-            metadata = build_structured_output(
-                model_name=provider_model,
-                response_text=response_text,
-                raw_response=raw_response,
-                latency_ms=timing["latency_ms"],
-                input_pricing=provider_pricing[0],
-                output_pricing=provider_pricing[1],
-                extra_fields={"provider_used": provider_label},
-            )
-            self.last_metadata = metadata
-            self._record_session_cost(metadata.get("total_cost"))
-            self._log_to_ledger(
-                call_type="invoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
-            )
-        # Shadow dispatch is observation-only and its cost is never counted
-        # toward max_session_cost -- run it after releasing the budget
-        # admission lock so it doesn't hold up other calls' admission checks.
-        self._dispatch_shadow_sync(messages, response_text)
-        return metadata if self.structured_output else response_text
+        return self._run_invoke(
+            prepared_input=messages,
+            resolved=resolved,
+            redacted_categories=redacted_categories,
+            redaction_map=redaction_map,
+            overrides=overrides,
+        )
 
     async def ainvoke(
         self,
@@ -1274,44 +842,16 @@ class OpenAIChatModel(BaseLLM):
     ) -> Any:
         """Async version of invoke(). See invoke() for **overrides semantics."""
         self._check_budget()
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-
-        if self.streaming:
-            chunks: List[str] = []
-            async for delta in self._ainvoke_stream_mode(messages=messages, overrides=overrides):
-                chunks.append(delta)
-            return "".join(chunks)
-
-        async with self._async_budget_admission():
-            with track_latency() as timing:
-                response_text, raw_response, provider_label, provider_model, provider_pricing = await self._ainvoke_non_stream(
-                    messages=messages, overrides=overrides
-                )
-
-            masked_response_text = response_text
-            if self.redact_restore_in_response:
-                response_text = restore_text(response_text, self._last_redaction_map)
-
-            metadata = build_structured_output(
-                model_name=provider_model,
-                response_text=response_text,
-                raw_response=raw_response,
-                latency_ms=timing["latency_ms"],
-                input_pricing=provider_pricing[0],
-                output_pricing=provider_pricing[1],
-                extra_fields={"provider_used": provider_label},
-            )
-            self.last_metadata = metadata
-            self._record_session_cost(metadata.get("total_cost"))
-            self._log_to_ledger(
-                call_type="ainvoke", prompt=resolved, metadata=metadata, response_override=masked_response_text
-            )
-        # Shadow dispatch is observation-only and its cost is never counted
-        # toward max_session_cost -- run it after releasing the budget
-        # admission lock so it doesn't hold up other calls' admission checks.
-        await self._dispatch_shadow_async(messages, response_text)
-        return metadata if self.structured_output else response_text
+        return await self._arun_invoke(
+            prepared_input=messages,
+            resolved=resolved,
+            redacted_categories=redacted_categories,
+            redaction_map=redaction_map,
+            overrides=overrides,
+        )
 
     # ── Validated structured output ──────────────────────────────────────────
     # Server-side json_schema strict mode (build_response_format) already
@@ -1319,34 +859,6 @@ class OpenAIChatModel(BaseLLM):
     # the result still fails Pydantic validation (e.g. a custom @field_validator,
     # or a provider that ignores strict mode), the error is sent back to the
     # model and it gets another chance to correct itself.
-
-    @staticmethod
-    def _is_pydantic_model_class(obj: Any) -> bool:
-        return isinstance(obj, type) and hasattr(obj, "model_validate_json")
-
-    def _require_structured_schema(self) -> None:
-        if not self._is_pydantic_model_class(self.output_schema):
-            raise OpenAIChatModelConfigError(
-                "invoke_structured()/ainvoke_structured() require output_schema= to be a "
-                "Pydantic BaseModel class (not a plain dict or None)."
-            )
-        if self.streaming:
-            raise OpenAIChatModelConfigError(
-                "invoke_structured()/ainvoke_structured() are incompatible with streaming=True."
-            )
-
-    @staticmethod
-    def _correction_messages(bad_text: str, error: Exception) -> List[Dict[str, Any]]:
-        return [
-            {"role": "assistant", "content": bad_text},
-            {
-                "role": "user",
-                "content": (
-                    "Your last response failed schema validation with this error:\n"
-                    f"{error}\n\nReturn corrected JSON that matches the schema exactly."
-                ),
-            },
-        ]
 
     def invoke_structured(
         self,
@@ -1371,52 +883,16 @@ class OpenAIChatModel(BaseLLM):
         """
         self._require_structured_schema()
         self._check_budget()
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-
-        with self._budget_admission():
-            last_error: Optional[Exception] = None
-            last_text: Optional[str] = None
-            for attempt in range(max_validation_retries + 1):
-                with track_latency() as timing:
-                    response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                        self._invoke_non_stream(messages=messages)
-                    )
-                masked_response_text = response_text
-                text_to_validate = response_text
-                if self.redact_restore_in_response:
-                    text_to_validate = restore_text(response_text, self._last_redaction_map)
-                last_text = text_to_validate
-                try:
-                    validated = self.output_schema.model_validate_json(text_to_validate)
-                except Exception as exc:
-                    last_error = exc
-                    # Feed back the model's own (still-masked) output — never the restored
-                    # text, which would leak the real secret into the model's own context.
-                    messages = messages + self._correction_messages(masked_response_text, exc)
-                    continue
-                self.last_metadata = build_structured_output(
-                    model_name=provider_model,
-                    response_text=text_to_validate,
-                    raw_response=raw_response,
-                    latency_ms=timing["latency_ms"],
-                    input_pricing=provider_pricing[0],
-                    output_pricing=provider_pricing[1],
-                    extra_fields={"provider_used": provider_label, "validation_retries": attempt},
-                )
-                self._record_session_cost(self.last_metadata.get("total_cost"))
-                self._log_to_ledger(
-                    call_type="invoke_structured", prompt=resolved, metadata=self.last_metadata,
-                    response_override=masked_response_text,
-                )
-                return validated
-
-            raise OpenAIChatModelValidationError(
-                f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
-                f"Last error: {last_error}",
-                raw_text=last_text,
-                validation_error=last_error,
-            )
+        return self._run_invoke_structured(
+            prepared_input=messages,
+            resolved=resolved,
+            redacted_categories=redacted_categories,
+            redaction_map=redaction_map,
+            max_validation_retries=max_validation_retries,
+        )
 
     async def ainvoke_structured(
         self,
@@ -1430,52 +906,16 @@ class OpenAIChatModel(BaseLLM):
         """Async version of invoke_structured()."""
         self._require_structured_schema()
         self._check_budget()
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-
-        async with self._async_budget_admission():
-            last_error: Optional[Exception] = None
-            last_text: Optional[str] = None
-            for attempt in range(max_validation_retries + 1):
-                with track_latency() as timing:
-                    response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                        await self._ainvoke_non_stream(messages=messages)
-                    )
-                masked_response_text = response_text
-                text_to_validate = response_text
-                if self.redact_restore_in_response:
-                    text_to_validate = restore_text(response_text, self._last_redaction_map)
-                last_text = text_to_validate
-                try:
-                    validated = self.output_schema.model_validate_json(text_to_validate)
-                except Exception as exc:
-                    last_error = exc
-                    # Feed back the model's own (still-masked) output — never the restored
-                    # text, which would leak the real secret into the model's own context.
-                    messages = messages + self._correction_messages(masked_response_text, exc)
-                    continue
-                self.last_metadata = build_structured_output(
-                    model_name=provider_model,
-                    response_text=text_to_validate,
-                    raw_response=raw_response,
-                    latency_ms=timing["latency_ms"],
-                    input_pricing=provider_pricing[0],
-                    output_pricing=provider_pricing[1],
-                    extra_fields={"provider_used": provider_label, "validation_retries": attempt},
-                )
-                self._record_session_cost(self.last_metadata.get("total_cost"))
-                self._log_to_ledger(
-                    call_type="ainvoke_structured", prompt=resolved, metadata=self.last_metadata,
-                    response_override=masked_response_text,
-                )
-                return validated
-
-            raise OpenAIChatModelValidationError(
-                f"Output failed schema validation after {max_validation_retries + 1} attempt(s). "
-                f"Last error: {last_error}",
-                raw_text=last_text,
-                validation_error=last_error,
-            )
+        return await self._arun_invoke_structured(
+            prepared_input=messages,
+            resolved=resolved,
+            redacted_categories=redacted_categories,
+            redaction_map=redaction_map,
+            max_validation_retries=max_validation_retries,
+        )
 
     def stream(
         self,
@@ -1487,9 +927,10 @@ class OpenAIChatModel(BaseLLM):
         **overrides: Any,
     ) -> Iterator[str]:
         """Stream text chunks synchronously. See invoke() for **overrides semantics."""
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-        return self._invoke_stream_mode(messages=messages, overrides=overrides)
+        return self._invoke_stream_mode(prompt_input=messages, overrides=overrides)
 
     async def astream(
         self,
@@ -1501,31 +942,22 @@ class OpenAIChatModel(BaseLLM):
         **overrides: Any,
     ) -> AsyncIterator[str]:
         """Stream text chunks asynchronously. See invoke() for **overrides semantics."""
-        resolved = self._resolve_prompt(prompt, prompt_variables, files)
+        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
-        async for chunk in self._ainvoke_stream_mode(messages=messages, overrides=overrides):
+        async for chunk in self._ainvoke_stream_mode(prompt_input=messages, overrides=overrides):
             yield chunk
 
     # ── Low-level create() / acreate() ───────────────────────────────────────
 
     def create(self, input_data: Any = None, **overrides: Any) -> Any:
         """Direct access to client.chat.completions.create() with managed retries."""
-        if input_data is None:
-            input_data = overrides.pop("messages", None)
-        if input_data is None:
-            raise ValueError("input_data (messages) is required")
-        params = self._build_base_params(messages=input_data, stream=False)
-        params.update(overrides)
+        params = self._prepare_create_params(input_data, overrides)
         return self._create_raw(params)
 
     async def acreate(self, input_data: Any = None, **overrides: Any) -> Any:
         """Async version of create()."""
-        if input_data is None:
-            input_data = overrides.pop("messages", None)
-        if input_data is None:
-            raise ValueError("input_data (messages) is required")
-        params = self._build_base_params(messages=input_data, stream=False)
-        params.update(overrides)
+        params = self._prepare_create_params(input_data, overrides)
         return await self._acreate_raw(params)
 
     # ── Batch ─────────────────────────────────────────────────────────────────
@@ -1544,10 +976,14 @@ class OpenAIChatModel(BaseLLM):
     def _tools_to_openai_format(tools: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert Autourgos tool dicts to the OpenAI {type, function} schema."""
         result: List[Dict[str, Any]] = []
-        for t in tools:
+        for i, t in enumerate(tools):
             if t.get("type") == "function":
                 result.append(t)
                 continue
+            if not t.get("name"):
+                raise OpenAIChatModelConfigError(
+                    f"Tool at index {i} is missing a 'name' key: {t!r}"
+                )
             fn_schema: Dict[str, Any] = {
                 "name": t["name"],
                 "description": t.get("description", ""),
@@ -1607,7 +1043,8 @@ class OpenAIChatModel(BaseLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        resolved = self._resolve_prompt(prompt, None, files)
+        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, None, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
         params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)
@@ -1631,7 +1068,8 @@ class OpenAIChatModel(BaseLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        resolved = self._resolve_prompt(prompt, None, files)
+        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, None, files)
+        self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
         params = self._build_base_params(messages=messages, stream=False, overrides=kwargs)

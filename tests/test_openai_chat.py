@@ -12,6 +12,7 @@ import json
 import threading
 import time
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -23,6 +24,7 @@ from autourgos_openaichat import (
     OpenAIChatModelConfigError,
     OpenAIChatModelImportError,
     OpenAIChatModelRedactionBlockedError,
+    OpenAIChatModelRefusalError,
     OpenAIChatModelResponseError,
     CircuitBreakerOpenException,
 )
@@ -51,6 +53,17 @@ def make_stream_chunks(words):
         choice = SimpleNamespace(delta=delta)
         chunks.append(SimpleNamespace(choices=[choice]))
     return chunks
+
+
+def make_usage_chunk(prompt_tokens=9, completion_tokens=10, total_tokens=19):
+    """
+    The terminal SSE chunk sent when stream_options={"include_usage": True}
+    is set -- no `delta`/`choices`, just `usage`. See extract_usage_bearing_event().
+    """
+    usage = SimpleNamespace(
+        prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=total_tokens
+    )
+    return SimpleNamespace(choices=[], usage=usage)
 
 
 class FakeSyncStream:
@@ -107,6 +120,152 @@ def test_invoke_passes_sampling_params():
     assert kwargs["temperature"] == 0.7
     assert kwargs["top_p"] == 0.9
     assert kwargs["max_tokens"] == 256
+
+
+def test_store_true_is_sent_when_set_at_construction():
+    llm = make_llm(store=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["store"] is True
+
+
+def test_store_false_is_sent_when_set_at_construction():
+    llm = make_llm(store=False)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["store"] is False
+
+
+def test_store_omitted_by_default():
+    """Regression: store used to be unreachable as a constructor setting at
+    all. None (default) must omit the key entirely, not send a literal null."""
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert "store" not in kwargs
+
+
+def test_store_per_call_override_wins_over_constructor_default():
+    llm = make_llm(store=True)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi", store=False)
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["store"] is False
+
+
+def test_o_series_model_gets_max_completion_tokens_not_max_tokens():
+    """
+    Regression test: OpenAI's Chat Completions `max_tokens` is deprecated
+    and documented as "not compatible with o-series models" (o1, o3,
+    o4-mini, ...) -- sending it 400s. o-series models must get
+    `max_completion_tokens` instead.
+    """
+    llm = OpenAIChatModel(model="o3-mini", api_key="sk-test", max_tokens=500)
+    llm._client = MagicMock()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("max_completion_tokens") == 500
+    assert "max_tokens" not in kwargs
+
+
+def test_o_series_model_drops_temperature_and_top_p():
+    """
+    Regression: o-series reasoning models reject temperature/top_p outright
+    (400) -- same model family, same "not compatible" constraint as
+    max_tokens (see test above). They must be dropped, not sent.
+    """
+    llm = OpenAIChatModel(model="o3-mini", api_key="sk-test", temperature=0.7, top_p=0.9)
+    llm._client = MagicMock()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert "top_p" not in kwargs
+
+
+def test_regular_model_still_gets_temperature_and_top_p():
+    llm = make_llm(temperature=0.7, top_p=0.9)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.7
+    assert kwargs["top_p"] == 0.9
+
+
+def test_regular_model_still_gets_max_tokens():
+    """Non-o-series models (the vast majority, including third-party/self-hosted
+    ones) must keep sending max_tokens as before -- no behavior change."""
+    llm = make_llm(max_tokens=256)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("max_tokens") == 256
+    assert "max_completion_tokens" not in kwargs
+
+
+def test_fallback_to_different_model_family_gets_correct_max_tokens_key():
+    """
+    The max_tokens/max_completion_tokens decision must be made per-target,
+    not once for the whole call -- a fallback provider can be a different
+    model family than the primary (e.g. primary gpt-4o, fallback o1-mini).
+    """
+    llm = make_llm_with_fallback(fallback_models=("o1-mini",), max_retries=1, max_tokens=500)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("ok")
+
+    llm.invoke("hi")
+    kwargs = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs
+    assert kwargs.get("max_completion_tokens") == 500
+    assert "max_tokens" not in kwargs
+
+
+def test_fallback_to_different_model_family_drops_temperature_top_p_per_target():
+    """
+    Same per-target reasoning as the max_tokens test above, applied to
+    temperature/top_p: a normal primary with temperature/top_p set must
+    still send them, but an o-series fallback must not.
+    """
+    llm = make_llm_with_fallback(
+        fallback_models=("o1-mini",), max_retries=1, temperature=0.7, top_p=0.9
+    )
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._fallback_sync_clients[0].chat.completions.create.return_value = make_completion("ok")
+
+    llm.invoke("hi")
+    kwargs = llm._fallback_sync_clients[0].chat.completions.create.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert "top_p" not in kwargs
+
+
+def test_invoke_streaming_o_series_model_drops_temperature_top_p():
+    llm = OpenAIChatModel(
+        model="o3-mini", api_key="sk-test", temperature=0.7, top_p=0.9, streaming=True
+    )
+    llm._client = MagicMock()
+    llm._client.chat.completions.create.return_value = FakeSyncStream(make_stream_chunks(["ok"]))
+    llm.invoke("hi")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in kwargs
+    assert "top_p" not in kwargs
+
+
+def test_max_tokens_override_to_max_completion_tokens_key_drops_stale_default():
+    """
+    A caller overriding with max_completion_tokens= (the "other" key name
+    than the constructor's max_tokens= default) must not end up sending
+    both keys -- overrides only add/replace same-named keys, so the stale
+    max_tokens default has to be explicitly cleaned up.
+    """
+    llm = make_llm(max_tokens=500)
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("hi", max_completion_tokens=999)
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs.get("max_completion_tokens") == 999
+    assert "max_tokens" not in kwargs
 
 
 def test_invoke_accepts_per_call_overrides():
@@ -184,6 +343,137 @@ def test_invoke_with_streaming_flag_joins_internally():
     assert llm.invoke("hi") == "Hello world"
 
 
+def test_stream_request_includes_stream_options_include_usage():
+    """stream_options={"include_usage": True} must be set for stream=True requests
+    (both stream() and invoke(streaming=True)) so the terminal usage chunk arrives."""
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = FakeSyncStream(make_stream_chunks(["ok"]))
+    list(llm.stream("hi"))
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["stream_options"] == {"include_usage": True}
+
+
+def test_invoke_streaming_tracks_budget_cost_and_ledger(tmp_path):
+    """
+    Regression test: invoke(streaming=True) used to bypass budget admission,
+    cost tracking, and the ledger entirely -- max_session_cost was silently
+    inert for streaming calls (a real billing/safety gap), and streaming
+    calls never appeared in the audit ledger. Now the terminal usage chunk
+    (stream_options={"include_usage": True}) lets the streaming path compute
+    cost and log to the ledger exactly like the non-streaming path.
+    """
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(
+        streaming=True, input_pricing=1000, output_pricing=1000,
+        max_session_cost=0.01, ledger_path=str(db_path),
+    )
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["Hello"]) + [make_usage_chunk(9, 10, 19)]
+    )
+
+    assert llm.invoke("hi") == "Hello"
+    assert llm.session_cost_used >= 0.01  # (9/1e6)*1000 + (10/1e6)*1000 = 0.019
+    assert llm.last_metadata["total_tokens"] == 19
+    assert llm.last_metadata["total_cost"] > 0
+
+    row = _read_ledger_rows(db_path)[0]
+    assert row["call_type"] == "invoke"
+    assert row["total_tokens"] == 19
+
+    with pytest.raises(BudgetExceededException):
+        llm.invoke("hi again")  # cap now exceeded -- must actually block
+
+
+def test_invoke_streaming_without_usage_chunk_degrades_gracefully():
+    """A provider that doesn't honor stream_options still returns text; cost
+    is simply left untracked for that call rather than crashing."""
+    llm = make_llm(streaming=True, input_pricing=1000, output_pricing=1000)
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["ok"])  # no trailing usage chunk
+    )
+    assert llm.invoke("hi") == "ok"
+    assert llm.last_metadata.get("total_cost") is None
+    assert llm.session_cost_used == 0.0
+
+
+def make_refusal_stream_chunks(refusal_text):
+    """A refusal-only stream: delta.refusal is set, delta.content stays None
+    on every chunk -- matches the real Chat Completions SDK's ChoiceDelta."""
+    chunks = []
+    for w in refusal_text:
+        delta = SimpleNamespace(content=None, refusal=w)
+        choice = SimpleNamespace(delta=delta)
+        chunks.append(SimpleNamespace(choices=[choice]))
+    return chunks
+
+
+def test_invoke_streaming_refusal_raises_refusal_error_not_generic():
+    """
+    Regression: a refusal-only stream (delta.refusal set, delta.content never
+    set) used to be silently dropped by extract_text_delta_from_event(),
+    surfacing only as a misleading generic "No text deltas" error.
+    """
+    llm = make_llm(streaming=True)
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_refusal_stream_chunks(["I can't ", "help with that."])
+    )
+    with pytest.raises(OpenAIChatModelRefusalError) as exc_info:
+        llm.invoke("hi")
+    assert exc_info.value.refusal_text == "I can't help with that."
+
+
+def test_invoke_streaming_refusal_does_not_fall_through_to_fallback():
+    """
+    Regression: a refusal on the primary used to be indistinguishable from a
+    real failure, so the streaming loop fell through to the next fallback
+    provider -- wasting a real API call for what was actually a valid,
+    final answer from a working primary.
+    """
+    llm = make_llm_with_fallback(max_retries=1)
+    llm.streaming = True
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_refusal_stream_chunks(["nope"])
+    )
+    with pytest.raises(OpenAIChatModelRefusalError):
+        llm.invoke("hi")
+    llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_ainvoke_streaming_refusal_raises_refusal_error():
+    llm = make_llm(streaming=True)
+    llm._async_client.chat.completions.create.return_value = FakeAsyncStream(
+        make_refusal_stream_chunks(["refused"])
+    )
+    with pytest.raises(OpenAIChatModelRefusalError) as exc_info:
+        await llm.ainvoke("hi")
+    assert exc_info.value.refusal_text == "refused"
+
+
+def test_invoke_non_stream_refusal_raises_refusal_error():
+    """Non-streaming path: message.refusal set, message.content None."""
+    llm = make_llm()
+    msg = SimpleNamespace(content=None, refusal="cannot comply", tool_calls=None)
+    choice = SimpleNamespace(message=msg)
+    usage = SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8)
+    llm._client.chat.completions.create.return_value = SimpleNamespace(choices=[choice], usage=usage)
+    with pytest.raises(OpenAIChatModelRefusalError) as exc_info:
+        llm.invoke("hi")
+    assert exc_info.value.refusal_text == "cannot comply"
+
+
+def test_invoke_streaming_restores_redacted_text():
+    """redact_restore_in_response must apply on the streaming invoke() path too --
+    it used to be skipped entirely, since streaming short-circuited before that code ran."""
+    llm = make_llm(streaming=True, redact_pii=True, redact_categories=["email"],
+                    redact_restore_in_response=True)
+    llm._client.chat.completions.create.return_value = FakeSyncStream(
+        make_stream_chunks(["Sure, noted: ", "[REDACTED:email:1]"])
+    )
+    result = llm.invoke("contact bob@example.com please")
+    assert result == "Sure, noted: bob@example.com"
+
+
 def test_stream_raises_on_empty_stream():
     llm = make_llm()
     llm._client.chat.completions.create.return_value = FakeSyncStream([])
@@ -203,6 +493,35 @@ def test_stream_accepts_per_call_overrides():
 
 
 # ── 4. Async streaming ───────────────────────────────────────────────────────
+
+def test_ainvoke_streaming_tracks_budget_cost_and_ledger(tmp_path):
+    """Async counterpart of test_invoke_streaming_tracks_budget_cost_and_ledger."""
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(
+        streaming=True, input_pricing=1000, output_pricing=1000,
+        max_session_cost=0.01, ledger_path=str(db_path),
+    )
+    llm._async_client.chat.completions.create.return_value = FakeAsyncStream(
+        make_stream_chunks(["Hello"]) + [make_usage_chunk(9, 10, 19)]
+    )
+
+    async def run():
+        return await llm.ainvoke("hi")
+
+    assert asyncio.run(run()) == "Hello"
+    assert llm.session_cost_used >= 0.01
+    assert llm.last_metadata["total_tokens"] == 19
+
+    row = _read_ledger_rows(db_path)[0]
+    assert row["call_type"] == "ainvoke"
+    assert row["total_tokens"] == 19
+
+    async def run_again():
+        return await llm.ainvoke("hi again")
+
+    with pytest.raises(BudgetExceededException):
+        asyncio.run(run_again())
+
 
 def test_astream_yields_chunks():
     llm = make_llm()
@@ -263,6 +582,54 @@ def test_system_prompt_prepended():
     messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
     assert messages[0] == {"role": "system", "content": "You are a pirate."}
     assert messages[1]["role"] == "user"
+
+
+def test_system_prompt_not_duplicated_when_list_prompt_has_its_own():
+    """
+    Regression: prompt= can be a pre-built messages list. If the caller's own
+    list already includes a system message, the constructor's system_prompt
+    must not also be prepended -- it used to produce two system messages.
+    """
+    llm = make_llm(system_prompt="Default system prompt")
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke([
+        {"role": "system", "content": "Caller specific system msg"},
+        {"role": "user", "content": "hi"},
+    ])
+    messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert messages == [
+        {"role": "system", "content": "Caller specific system msg"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_system_prompt_still_prepended_when_list_prompt_has_none():
+    """No regression: a list prompt without its own system message still
+    gets the constructor's system_prompt prepended, same as before."""
+    llm = make_llm(system_prompt="Default system prompt")
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke([{"role": "user", "content": "hi"}])
+    messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert messages == [
+        {"role": "system", "content": "Default system prompt"},
+        {"role": "user", "content": "hi"},
+    ]
+
+
+def test_system_prompt_not_duplicated_when_list_prompt_has_developer_role():
+    """The newer "developer" role (system's documented replacement for
+    reasoning models) also suppresses the constructor default."""
+    llm = make_llm(system_prompt="Default system prompt")
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke([
+        {"role": "developer", "content": "Caller developer msg"},
+        {"role": "user", "content": "hi"},
+    ])
+    messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
+    assert messages == [
+        {"role": "developer", "content": "Caller developer msg"},
+        {"role": "user", "content": "hi"},
+    ]
 
 
 def test_unknown_kwarg_raises_type_error():
@@ -388,6 +755,16 @@ def test_invoke_with_tools_returns_tool_calls():
     kwargs = llm._client.chat.completions.create.call_args.kwargs
     assert kwargs["tools"][0]["type"] == "function"
     assert kwargs["tool_choice"] == "auto"
+
+
+def test_invoke_with_tools_missing_name_raises_config_error_not_key_error():
+    """
+    Regression: a tool dict missing "name" used to raise a raw, unhelpful
+    KeyError instead of this library's own OpenAIChatModelConfigError.
+    """
+    llm = make_llm()
+    with pytest.raises(OpenAIChatModelConfigError, match="index 0"):
+        llm.invoke_with_tools("hi", [{"description": "missing its name key"}])
 
 
 def test_invoke_with_tools_accepts_per_call_overrides():
@@ -537,6 +914,43 @@ def test_circuit_breaker_opens_after_threshold_and_blocks():
         llm.invoke("hi")
 
 
+def test_ainvoke_from_multiple_concurrent_event_loops_does_not_deadlock():
+    """
+    Regression: the async circuit-breaker/budget-admission lock used to be a
+    single asyncio.Lock shared for the instance's whole lifetime. asyncio.Lock
+    is not thread-safe -- two threads each running their own event loop and
+    concurrently `async with`-ing the *same* Lock object could deadlock
+    (reproduced directly before the fix: 4 threads hammering one shared Lock
+    hung indefinitely). Each event loop must get its own lock instead.
+
+    Runs several threads, each with its own asyncio.run() loop, all calling
+    ainvoke() concurrently on one shared instance, with a bounded join
+    timeout so a regression fails the test instead of hanging the suite.
+    """
+    llm = make_llm(max_session_cost=1000.0, input_pricing=1.0, output_pricing=1.0)
+    llm._async_client.chat.completions.create.return_value = make_completion("ok")
+
+    errors: List[Exception] = []
+
+    def worker():
+        async def run_calls():
+            for _ in range(10):
+                await llm.ainvoke("hi")
+        try:
+            asyncio.run(run_calls())
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=15)
+
+    assert not any(t.is_alive() for t in threads), "deadlocked -- a thread never finished"
+    assert not errors, f"unexpected errors: {errors}"
+
+
 def test_circuit_breaker_resets_on_success():
     llm = make_llm(circuit_failure_threshold=3, max_retries=1)
     llm._client.chat.completions.create.side_effect = ConnectionError("boom")
@@ -674,6 +1088,22 @@ def test_config_error_streaming_and_structured_output():
         make_llm(structured_output=True, streaming=True)
 
 
+def test_config_error_max_retries_zero_or_negative():
+    """
+    Regression test: max_retries is used as range(1, max_retries + 1) in every
+    retry loop, so max_retries=0 made the loop never run at all -- the
+    non-stream path silently sent zero API calls while raising a misleading
+    "Unexpected retry exhaustion" error, and the stream path crashed with
+    TypeError ("exceptions must derive from BaseException") from `raise None`.
+    Since max_retries is the *total* attempt count (not retries after the
+    first), 0 attempts is nonsensical and is now rejected at construction.
+    """
+    with pytest.raises(OpenAIChatModelConfigError, match="max_retries must be >= 1"):
+        make_llm(max_retries=0)
+    with pytest.raises(OpenAIChatModelConfigError, match="max_retries must be >= 1"):
+        make_llm(max_retries=-1)
+
+
 def test_import_error_when_openai_sdk_missing():
     # _OPENAI_AVAILABLE is resolved once at module import time (chat.py:40), not
     # per-instantiation, so the SDK-missing path is exercised by patching that
@@ -734,6 +1164,58 @@ def test_acreate_low_level():
         return await llm.acreate([{"role": "user", "content": "Hi"}])
 
     assert asyncio.run(run()) is raw
+
+
+def test_create_messages_override_cannot_hijack_validated_input_data():
+    """
+    Regression: a `messages=` kwarg passed alongside `input_data=` used to
+    silently replace the already-validated input_data via the unfiltered
+    **overrides merge -- the ValueError check above it became meaningless.
+    """
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.create(
+        input_data=[{"role": "user", "content": "validated one"}],
+        messages=[{"role": "user", "content": "SNUCK IN"}],
+    )
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["messages"] == [{"role": "user", "content": "validated one"}]
+
+
+def test_create_stream_override_is_ignored():
+    """
+    Regression: `stream=True` used to silently flip create() into streaming
+    mode, returning a raw stream iterator that _create_raw()'s retry logic
+    doesn't handle, instead of the documented non-streaming completion.
+    """
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.create(input_data=[{"role": "user", "content": "hi"}], stream=True)
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["stream"] is False
+
+
+def test_create_model_override_still_works():
+    """model= must stay overridable -- only messages/stream are protected."""
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.create(input_data=[{"role": "user", "content": "hi"}], model="gpt-4o-mini")
+    kwargs = llm._client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_acreate_messages_and_stream_overrides_are_ignored():
+    llm = make_llm()
+    llm._async_client.chat.completions.create.return_value = make_completion("ok")
+    await llm.acreate(
+        input_data=[{"role": "user", "content": "validated one"}],
+        messages=[{"role": "user", "content": "SNUCK IN"}],
+        stream=True,
+    )
+    kwargs = llm._async_client.chat.completions.create.call_args.kwargs
+    assert kwargs["messages"] == [{"role": "user", "content": "validated one"}]
+    assert kwargs["stream"] is False
 
 
 # ── 18. Repr / misc ──────────────────────────────────────────────────────────
@@ -829,6 +1311,11 @@ def test_parse_tool_calls_returns_empty_when_no_choices():
 
 
 def test_multimodal_from_real_file_path(tmp_path):
+    """
+    .jpg must map to the correct IANA media type image/jpeg, not the
+    invalid image/jpg some providers reject outright -- see
+    test_encode_file_mime_types below for full coverage of this mapping.
+    """
     img = tmp_path / "photo.jpg"
     img.write_bytes(b"\xff\xd8\xff\xe0fakejpegdata")
     llm = make_llm()
@@ -836,7 +1323,44 @@ def test_multimodal_from_real_file_path(tmp_path):
     llm.invoke("What is this?", files=[str(img)])
     messages = llm._client.chat.completions.create.call_args.kwargs["messages"]
     url = messages[0]["content"][1]["image_url"]["url"]
-    assert url.startswith("data:image/jpg;base64,")
+    assert url.startswith("data:image/jpeg;base64,")
+
+
+@pytest.mark.parametrize("ext,expected_mime", [
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("png", "image/png"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+])
+def test_encode_file_mime_types(tmp_path, ext, expected_mime):
+    """Every OpenAI-vision-supported extension must map to its correct IANA media type."""
+    img = tmp_path / f"photo.{ext}"
+    img.write_bytes(b"fakedata")
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    llm.invoke("describe", files=[str(img)])
+    url = llm._client.chat.completions.create.call_args.kwargs["messages"][0]["content"][1]["image_url"]["url"]
+    assert url.startswith(f"data:{expected_mime};base64,")
+
+
+def test_encode_file_unsupported_extension_warns_but_still_sends(tmp_path, caplog):
+    """
+    Regression test: an unrecognized extension (e.g. a PDF passed to
+    files=, which this module has no dedicated support for -- vision-only)
+    used to silently become a fabricated image/<ext> MIME type with zero
+    warning. It must still be sent (not silently dropped), but now with a
+    clear local warning naming the actual problem.
+    """
+    doc = tmp_path / "report.pdf"
+    doc.write_bytes(b"%PDF-1.4 fake")
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("ok")
+    with caplog.at_level("WARNING"):
+        llm.invoke("describe", files=[str(doc)])
+    url = llm._client.chat.completions.create.call_args.kwargs["messages"][0]["content"][1]["image_url"]["url"]
+    assert url.startswith("data:image/pdf;base64,")  # still sent -- best-effort, not silently dropped
+    assert any("isn't a recognized image" in r.message for r in caplog.records)
 
 
 def test_multimodal_from_dict_data_field():
@@ -894,6 +1418,70 @@ def test_structured_output_strict_schema_sets_additional_properties_false():
     assert schema["additionalProperties"] is False
     nested = schema["$defs"]["Address"]
     assert nested["additionalProperties"] is False
+
+
+def test_structured_output_strict_schema_requires_every_property():
+    """
+    Regression test: OpenAI/Azure strict json_schema mode also requires every
+    key in `properties` to appear in `required` -- but Pydantic's
+    model_json_schema() only lists fields without a default, omitting
+    Optional/defaulted fields from `required`. A model with any such field
+    used to still 400 even after additionalProperties was fixed. Covers both
+    the top-level schema and a nested $defs model.
+    """
+    class Address(BaseModel):
+        city: str
+        zip_code: Optional[str] = None
+
+    class Person(BaseModel):
+        name: str
+        nickname: str = "N/A"
+        address: Optional[Address] = None
+
+    llm = make_llm(output_schema=Person, structured_output=True)
+    llm._client.chat.completions.create.return_value = make_completion('{"name": "x"}')
+    llm.invoke("go")
+    schema = llm._client.chat.completions.create.call_args.kwargs["response_format"]["json_schema"]["schema"]
+
+    assert set(schema["required"]) == set(schema["properties"].keys())
+    assert "nickname" in schema["required"]  # has a default, but must still be required
+    assert "address" in schema["required"]   # Optional, but must still be required
+
+    nested = schema["$defs"]["Address"]
+    assert set(nested["required"]) == set(nested["properties"].keys())
+    assert "zip_code" in nested["required"]
+
+
+def test_enforce_additional_properties_false_does_not_mutate_input():
+    """
+    Regression: enforce_additional_properties_false() used to mutate its
+    input dict (and nested dicts reachable from it) in place. A caller
+    passing a raw schema dict who still holds a reference to a nested object
+    node (e.g. a property that is itself an object) used to see that node
+    silently gain additionalProperties/required as a side effect, even
+    though they never passed it to this function directly.
+    """
+    from autourgos_openaichat.core import enforce_additional_properties_false
+
+    nested_object_node = {"type": "object", "properties": {"city": {"type": "string"}}}
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}, "address": nested_object_node},
+    }
+    original_nested_snapshot = {"type": "object", "properties": {"city": {"type": "string"}}}
+
+    result = enforce_additional_properties_false(schema)
+
+    # The caller's own nested object must be completely untouched.
+    assert nested_object_node == original_nested_snapshot
+    assert "additionalProperties" not in nested_object_node
+    assert "required" not in nested_object_node
+    assert schema["properties"]["address"] is nested_object_node
+
+    # The returned schema must have the strict-mode fields applied.
+    assert result["additionalProperties"] is False
+    assert result["properties"]["address"]["additionalProperties"] is False
+    assert result["properties"]["address"]["required"] == ["city"]
 
 
 def test_stream_delta_extraction_dict_fallback():
@@ -1512,6 +2100,20 @@ def test_unknown_redact_category_raises_config_error():
         OpenAIChatModel(model="gpt-4o", api_key="sk-test", redact_pii=True, redact_categories=["not_a_real_category"])
 
 
+def test_invalid_custom_regex_raises_config_error_not_raw_re_error():
+    """
+    Regression: re.error is not a ValueError subclass, so a malformed
+    redact_custom_patterns regex used to bypass the constructor's
+    `except ValueError` guard entirely and leak out as a raw re.error
+    instead of the library's own OpenAIChatModelConfigError.
+    """
+    with pytest.raises(OpenAIChatModelConfigError):
+        OpenAIChatModel(
+            model="gpt-4o", api_key="sk-test", redact_pii=True,
+            redact_custom_patterns={"bad": "(unbalanced"},
+        )
+
+
 def test_ledger_records_redacted_categories(tmp_path):
     db_path = tmp_path / "calls.db"
     llm = make_llm(ledger_path=str(db_path), redact_pii=True)
@@ -1519,6 +2121,41 @@ def test_ledger_records_redacted_categories(tmp_path):
     llm.invoke("my email is bob@example.com")
     row = _read_ledger_rows(db_path)[0]
     assert row["redacted_categories"] == "email"
+
+
+def test_ledger_records_redacted_categories_correctly_under_concurrency(tmp_path):
+    """
+    Regression test: _log_to_ledger() used to read self.last_redacted_categories,
+    a shared instance attribute -- a concurrent call whose prompt matched a
+    *different* category could overwrite it before this call's own ledger
+    write happened, mislabeling the audit trail. Now each call's ledger row
+    always carries its own call-local categories.
+    """
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path), redact_pii=True)
+
+    async def create(**kwargs):
+        content = kwargs["messages"][0]["content"]
+        # The "ssn" call resolves *last*, well after the "email" call --
+        # if categories were shared, the email call's ledger row could end
+        # up mislabeled with "ssn" (or vice versa).
+        await asyncio.sleep(0.05 if "ssn" in content else 0.01)
+        return make_completion("ok")
+
+    llm._async_client.chat.completions.create.side_effect = create
+
+    async def run():
+        await asyncio.gather(
+            llm.ainvoke("my ssn is 123-45-6789"),
+            llm.ainvoke("my email is bob@example.com"),
+        )
+
+    asyncio.run(run())
+    rows = _read_ledger_rows(db_path)
+    ssn_row = next(r for r in rows if "REDACTED:ssn" in r["prompt"])
+    email_row = next(r for r in rows if "REDACTED:email" in r["prompt"])
+    assert ssn_row["redacted_categories"] == "ssn"
+    assert email_row["redacted_categories"] == "email"
 
 
 # ── 23. Shadow-mode dual dispatch ────────────────────────────────────────────
@@ -1624,6 +2261,63 @@ def test_shadow_on_result_callback_invoked():
     assert seen[0]["provider_used"] == "shadow[0]:backup-model"
 
 
+def test_shadow_dispatch_runs_concurrently_with_primary():
+    """
+    Regression test: shadow dispatch used to only start after the primary
+    call's entire budget-admission block (including its own network
+    round-trip) had already finished -- sequential, not concurrent, despite
+    the docstring/README claiming total latency is roughly
+    max(primary, slowest shadow) rather than their sum. Both a slow primary
+    and a slow shadow call here should now overlap.
+    """
+    llm = make_llm_with_shadow()
+    delay = 0.2
+
+    def slow_primary(**kw):
+        time.sleep(delay)
+        return make_completion("Paris")
+
+    def slow_shadow(**kw):
+        time.sleep(delay)
+        return make_completion("Paris")
+
+    llm._client.chat.completions.create.side_effect = slow_primary
+    llm._shadow_sync_clients[0].chat.completions.create.side_effect = slow_shadow
+
+    start = time.perf_counter()
+    result = llm.invoke("hi")
+    elapsed = time.perf_counter() - start
+
+    assert result == "Paris"
+    assert len(llm.last_shadow_results) == 1
+    # Sequential would take ~2*delay; concurrent should stay well under that.
+    assert elapsed < delay * 1.8, f"expected concurrent dispatch (~{delay}s), took {elapsed}s"
+
+
+def test_shadow_still_fires_and_is_logged_when_primary_fails():
+    """
+    Regression test: since shadow dispatch now starts before the primary's
+    own request (to achieve real concurrency), an in-flight shadow request
+    can no longer be silently skipped if the primary ends up failing -- it's
+    already been sent and can't be un-billed. Its result must still be
+    collected and logged (with similarity=None, since there's no primary
+    text to compare against), and the primary's own exception must still
+    propagate correctly to the caller.
+    """
+    llm = make_llm_with_shadow(max_retries=1)
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._shadow_sync_clients[0].chat.completions.create.return_value = make_completion("shadow-answer")
+
+    with pytest.raises(OpenAIChatModelAPIError):
+        llm.invoke("hi")
+
+    assert len(llm.last_shadow_results) == 1
+    shadow = llm.last_shadow_results[0]
+    assert shadow["response"] == "shadow-answer"
+    assert shadow["similarity"] is None
+    assert shadow["error"] is None
+
+
 def test_shadow_recorded_in_ledger(tmp_path):
     db_path = tmp_path / "calls.db"
     llm = make_llm_with_shadow(ledger_path=str(db_path))
@@ -1652,6 +2346,24 @@ def test_ainvoke_shadow_dispatch():
     assert result == "Berlin"
     assert len(llm.last_shadow_results) == 1
     assert llm.last_shadow_results[0]["similarity"] == 1.0
+
+
+def test_ainvoke_shadow_still_fires_and_is_logged_when_primary_fails():
+    """Async counterpart of test_shadow_still_fires_and_is_logged_when_primary_fails."""
+    llm = make_llm_with_shadow(max_retries=1)
+    llm._async_client.chat.completions.create.side_effect = RuntimeError("primary down")
+    llm._shadow_async_clients[0].chat.completions.create.return_value = make_completion("shadow-answer")
+
+    async def run():
+        return await llm.ainvoke("hi")
+
+    with pytest.raises(OpenAIChatModelAPIError):
+        asyncio.run(run())
+
+    assert len(llm.last_shadow_results) == 1
+    shadow = llm.last_shadow_results[0]
+    assert shadow["response"] == "shadow-answer"
+    assert shadow["similarity"] is None
 
 
 def test_shadow_config_missing_model_raises():
@@ -1704,6 +2416,43 @@ def test_redact_restore_multiple_secrets_each_correct():
     )
     result = llm.invoke("emails: alice@example.com and bob@example.com")
     assert result == "Contacts: alice@example.com and bob@example.com"
+
+
+def test_redact_restore_concurrent_ainvoke_never_cross_contaminates():
+    """
+    Regression test: _apply_redaction()/_resolve_prompt() used to write the
+    redaction map to shared instance attributes (self._last_redaction_map),
+    so two concurrent ainvoke() calls sharing one instance could restore
+    using each other's mapping -- e.g. user A's response getting user B's
+    secret spliced in if B's call happened to finish first. The fix makes
+    the redaction map call-local (threaded through the return value), so
+    each call must always restore its own secret regardless of completion
+    order.
+    """
+    llm = make_llm(redact_pii=True, redact_categories=["email"], redact_restore_in_response=True)
+
+    async def create(**kwargs):
+        content = kwargs["messages"][0]["content"]
+        # Whichever call is for "userA" resolves *last*, well after "userB" --
+        # if redaction state were shared, userA's restore would race against
+        # userB's already-overwritten mapping.
+        await asyncio.sleep(0.05 if "userA" in content else 0.01)
+        placeholder = "[REDACTED:email:1]"
+        return make_completion(f"Confirming contact: {placeholder}")
+
+    llm._async_client.chat.completions.create.side_effect = create
+
+    async def run():
+        return await asyncio.gather(
+            llm.ainvoke("userA email is alice-private@corp.internal"),
+            llm.ainvoke("userB email is bob-private@corp.internal"),
+        )
+
+    results = asyncio.run(run())
+    assert results[0] == "Confirming contact: alice-private@corp.internal"
+    assert results[1] == "Confirming contact: bob-private@corp.internal"
+    assert "bob-private@corp.internal" not in results[0]
+    assert "alice-private@corp.internal" not in results[1]
 
 
 def test_redact_restore_ledger_stays_masked(tmp_path):

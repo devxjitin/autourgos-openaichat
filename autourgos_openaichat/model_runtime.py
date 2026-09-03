@@ -7,8 +7,6 @@ Self-contained: no autourgos-core dependency.
 from __future__ import annotations
 
 import logging
-import os
-import warnings
 from contextlib import contextmanager
 from string import Formatter
 from typing import Any, Dict, Iterator, Optional
@@ -99,6 +97,27 @@ def build_structured_output(
 
 # ── Text extraction ───────────────────────────────────────────────────────────
 
+def extract_refusal_from_response(resp: Any) -> Optional[str]:
+    """
+    Extract the model's refusal message from a non-streaming Chat Completions
+    response, if present. ``message.refusal`` is a separate field from
+    ``message.content`` -- a pure refusal leaves ``content`` empty, so
+    ``extract_text_from_response()`` alone would return ``None`` with no way
+    to tell a refusal apart from a genuinely malformed/empty response.
+    """
+    if resp is None:
+        return None
+    choices = resp.get("choices") if isinstance(resp, dict) else getattr(resp, "choices", None)
+    if choices:
+        first = choices[0]
+        msg = first.get("message") if isinstance(first, dict) else getattr(first, "message", None)
+        if msg:
+            refusal = msg.get("refusal") if isinstance(msg, dict) else getattr(msg, "refusal", None)
+            if isinstance(refusal, str) and refusal.strip():
+                return refusal
+    return None
+
+
 def extract_text_from_response(resp: Any) -> Optional[str]:
     """Extract generated text from an OpenAI completion response."""
     if resp is None:
@@ -185,11 +204,16 @@ def coerce_prompt_variable(value: Any) -> str:
 # ── Process-level runtime setup ───────────────────────────────────────────────
 
 def configure_runtime_environment() -> None:
-    """Suppress noisy SDK diagnostics."""
-    os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
-    os.environ.setdefault("GLOG_minloglevel", "2")
-    os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-    warnings.filterwarnings("ignore", category=UserWarning, module=".*grpc.*")
+    """
+    No-op, kept only for backward compatibility.
+
+    Used to set GRPC_VERBOSITY/GLOG_minloglevel/TF_CPP_MIN_LOG_LEVEL and
+    filter gRPC UserWarnings globally -- this library only depends on
+    `openai` (transport is httpx, not gRPC) and has no TensorFlow/glog
+    dependency anywhere, so those were irrelevant, unconditional, process-
+    wide side effects triggered merely by importing this package. Left as an
+    empty no-op rather than removed since it's a public exported symbol.
+    """
 
 
 __all__ = [
@@ -197,6 +221,7 @@ __all__ = [
     "extract_usage_metadata",
     "build_structured_output",
     "extract_text_from_response",
+    "extract_refusal_from_response",
     "extract_template_fields",
     "coerce_prompt_variable",
     "configure_runtime_environment",

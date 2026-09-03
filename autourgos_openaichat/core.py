@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,44 @@ def normalize_model_name(model: str) -> str:
 
 # ── Multi-modal message building ──────────────────────────────────────────────
 
+# The only image formats OpenAI vision (Chat Completions and Responses API
+# alike) actually supports -- everything else the provider will reject
+# regardless of what MIME type we send.
+_IMAGE_EXTENSION_MIME_TYPES = {
+    "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+}
+
+
+def _guess_image_mime_type(file_path: str, ext: str) -> str:
+    """
+    Map a file extension to its correct image MIME type for vision input.
+
+    A plain ``f"image/{ext}"`` guess is wrong for real, supported formats
+    whose extension doesn't match their IANA subtype name -- ``.jpg``/
+    ``.jpeg`` are ``image/jpeg``, not ``image/jpg``, which some providers
+    reject outright. For an extension outside the four formats OpenAI vision
+    actually supports (png/jpeg/gif/webp), a best-effort ``image/<ext>``
+    guess is still returned (so the file isn't silently dropped from the
+    message -- matches the existing send-anyway-with-a-warning philosophy
+    used for the URL-fallback case below), but it's logged clearly since the
+    provider will very likely reject it -- better a local warning naming the
+    real problem than a confusing remote 400.
+    """
+    mime = _IMAGE_EXTENSION_MIME_TYPES.get(ext)
+    if mime is not None:
+        return mime
+    logger.warning(
+        "_encode_file: %r has extension %r, which isn't a recognized image "
+        "type (supported: png, jpg/jpeg, gif, webp). Sending as image/%s "
+        "anyway, but the provider will likely reject it.",
+        file_path, ext, ext,
+    )
+    return f"image/{ext}"
+
+
 def _encode_file(file: Any) -> Optional[Dict[str, Any]]:
     """
     Encode a file into an OpenAI image_url content part.
@@ -157,7 +196,7 @@ def _encode_file(file: Any) -> Optional[Dict[str, Any]]:
             with open(file, "rb") as fh:
                 raw = fh.read()
             ext = file.rsplit(".", 1)[-1].lower() if "." in file else "png"
-            mime = f"image/{ext}"
+            mime = _guess_image_mime_type(file, ext)
             data = base64.b64encode(raw).decode()
             return {
                 "type": "image_url",
@@ -219,7 +258,8 @@ def build_multimodal_messages(
 
 def enforce_additional_properties_false(schema: Any) -> Any:
     """
-    Recursively set ``additionalProperties: False`` on every object node.
+    Recursively set ``additionalProperties: False`` on every object node, and
+    make ``required`` list every key in that node's ``properties``.
 
     OpenAI/Azure's ``strict: true`` json_schema mode rejects any object node
     that doesn't explicitly forbid extra properties. Pydantic's
@@ -229,24 +269,43 @@ def enforce_additional_properties_false(schema: Any) -> Any:
     including inside ``$defs``, ``properties``, ``items``, and the
     ``anyOf``/``allOf``/``oneOf`` branches Pydantic emits for nested/optional
     models.
+
+    Strict mode also requires *every* property key to appear in ``required``,
+    but Pydantic only lists fields without a default (``Optional``/defaulted
+    fields are omitted) -- so any schema with such a field would otherwise
+    still 400 even with ``additionalProperties`` fixed. ``required`` is
+    overwritten (not merged) with the full property-key list to cover that.
+    Note this means a defaulted-but-non-``Optional`` field becomes something
+    the model must always emit a value for -- strict mode has no notion of
+    "optional with a default", only "required" vs. a nullable type; callers
+    wanting true optionality should use ``Optional[X] = None``, which Pydantic
+    already serializes as a nullable type unaffected by this.
     """
     if isinstance(schema, dict):
-        if schema.get("type") == "object" or "properties" in schema:
-            schema.setdefault("additionalProperties", False)
+        # Returns a new dict rather than mutating `schema` in place -- this is
+        # a public function (also called directly by autourgos-responses on
+        # its own schemas) and the caller's input dict (including nested
+        # dicts reachable from it) must be left untouched, not silently
+        # rewritten as a side effect.
+        result = dict(schema)
+        if result.get("type") == "object" or "properties" in result:
+            result.setdefault("additionalProperties", False)
+            properties = result.get("properties")
+            if isinstance(properties, dict):
+                result["required"] = list(properties.keys())
         for key in ("properties", "$defs", "definitions"):
-            sub = schema.get(key)
+            sub = result.get(key)
             if isinstance(sub, dict):
-                for value in sub.values():
-                    enforce_additional_properties_false(value)
+                result[key] = {k: enforce_additional_properties_false(v) for k, v in sub.items()}
         for key in ("items", "additionalProperties"):
-            sub = schema.get(key)
+            sub = result.get(key)
             if isinstance(sub, dict):
-                enforce_additional_properties_false(sub)
+                result[key] = enforce_additional_properties_false(sub)
         for key in ("anyOf", "allOf", "oneOf"):
-            sub = schema.get(key)
+            sub = result.get(key)
             if isinstance(sub, list):
-                for value in sub:
-                    enforce_additional_properties_false(value)
+                result[key] = [enforce_additional_properties_false(v) for v in sub]
+        return result
     return schema
 
 
@@ -299,6 +358,80 @@ def build_response_format(
     return None
 
 
+# ── Per-target max_tokens / max_completion_tokens handling ───────────────────
+# OpenAI's Chat Completions `max_tokens` is deprecated in favor of
+# `max_completion_tokens` and is documented as "not compatible with o-series
+# models" (o1, o3, o4-mini, ...) -- sending it to one of those models 400s.
+# `build_chat_completion_create_params()` is called once per logical call,
+# before it's known which target (primary/fallback[i]/shadow[i]) will
+# actually receive the request -- a fallback or shadow provider can be a
+# different model family than the primary. So the rename can't happen at
+# build time; it happens per-target, right where each dispatch site already
+# swaps in that target's `model` right before sending.
+
+_MAX_COMPLETION_TOKENS_MODEL_PATTERN = re.compile(r"^o\d", re.IGNORECASE)
+
+
+def model_requires_max_completion_tokens(model_name: str) -> bool:
+    """
+    True for OpenAI's o-series reasoning models (o1, o1-mini, o1-preview, o3,
+    o3-mini, o3-pro, o4-mini, ...), detected by the documented ``o<digit>``
+    naming convention. Any other model -- including third-party/self-hosted
+    models -- keeps using ``max_tokens`` as before.
+    """
+    return bool(_MAX_COMPLETION_TOKENS_MODEL_PATTERN.match(model_name.strip()))
+
+
+def apply_max_tokens_param(params: Dict[str, Any], model_name: str) -> None:
+    """
+    Rename an already-set ``params["max_tokens"]`` to
+    ``"max_completion_tokens"`` if ``model_name`` is an o-series model.
+
+    If the caller already explicitly set ``max_completion_tokens`` themselves
+    via a per-call override, that value is never touched/renamed -- but a
+    stale ``max_tokens`` can still be sitting in ``params`` alongside it (the
+    constructor's ``max_tokens=`` default, baked in by ``_build_base_params``
+    before the override was merged in under the *other* key name -- merging
+    overrides only adds/replaces same-named keys, it doesn't know these two
+    key names mean the same thing). Sending both in one request is at best
+    redundant and at worst rejected by the provider, so the stale one is
+    dropped in that case too.
+    """
+    if "max_completion_tokens" in params:
+        params.pop("max_tokens", None)
+        return
+    if "max_tokens" not in params:
+        return
+    if model_requires_max_completion_tokens(model_name):
+        params["max_completion_tokens"] = params.pop("max_tokens")
+
+
+def strip_unsupported_sampling_params(params: Dict[str, Any], model_name: str) -> None:
+    """
+    Drop ``temperature``/``top_p`` from ``params`` in place if ``model_name``
+    is an o-series reasoning model -- those models reject both params
+    outright (400), same model family and same reasoning as
+    ``apply_max_tokens_param()`` above. Called at the same per-target sites,
+    for the same reason: a fallback/shadow target can be a different model
+    family than the primary, so this can't be decided at build time.
+
+    Dropped rather than raised, so a caller with temperature/top_p set for a
+    non-reasoning primary (with an o-series fallback configured, say) doesn't
+    get a hard failure -- just a warning and the call proceeds without them.
+    """
+    if not model_requires_max_completion_tokens(model_name):
+        return
+    for key in ("temperature", "top_p"):
+        if key in params:
+            del params[key]
+            logger.warning(
+                "%s doesn't support %r -- dropped from the request instead of "
+                "sending it and getting a 400 (o-series reasoning models reject "
+                "temperature/top_p entirely).",
+                model_name, key,
+            )
+
+
 # ── Chat Completions params builder ───────────────────────────────────────────
 
 def build_chat_completion_create_params(
@@ -325,6 +458,14 @@ def build_chat_completion_create_params(
         params["max_tokens"] = max_tokens
     if response_format is not None:
         params["response_format"] = response_format
+    if stream:
+        # Without this, a Chat Completions stream never includes token usage
+        # anywhere in its SSE chunks -- callers that need cost/ledger data
+        # from a streaming call (invoke(streaming=True)) would have no way
+        # to get it. The extra terminal chunk this adds has no `delta`, so
+        # extract_text_delta_from_event() already ignores it for callers
+        # that only want text (stream()/astream()).
+        params["stream_options"] = {"include_usage": True}
     return params
 
 
@@ -353,6 +494,48 @@ def extract_text_delta_from_event(event: Any) -> Optional[str]:
     return None
 
 
+def extract_refusal_delta_from_event(event: Any) -> Optional[str]:
+    """
+    Extract incremental refusal text from a Chat Completions streaming chunk.
+
+    ``delta.refusal`` is a separate field from ``delta.content`` -- a refusal
+    chunk never populates ``content``, so ``extract_text_delta_from_event()``
+    alone would silently drop it and the caller would see no text at all.
+    """
+    choices = getattr(event, "choices", None)
+    if choices:
+        delta = getattr(choices[0], "delta", None)
+        if delta is not None:
+            refusal = getattr(delta, "refusal", None)
+            if isinstance(refusal, str):
+                return refusal
+
+    if isinstance(event, dict):
+        choices = event.get("choices")
+        if choices:
+            delta = choices[0].get("delta", {})
+            refusal = delta.get("refusal")
+            if isinstance(refusal, str):
+                return refusal
+
+    return None
+
+
+def extract_usage_bearing_event(event: Any) -> Optional[Any]:
+    """
+    Return ``event`` itself if it carries token usage, else ``None``.
+
+    With ``stream_options={"include_usage": True}`` set (see
+    ``build_chat_completion_create_params``), a Chat Completions stream ends
+    with one extra chunk that has ``usage`` populated and an empty/absent
+    ``choices`` -- this is how a streaming caller (``invoke(streaming=True)``)
+    gets the token counts needed for cost tracking and the ledger, since no
+    other chunk carries them.
+    """
+    usage = event.get("usage") if isinstance(event, dict) else getattr(event, "usage", None)
+    return event if usage is not None else None
+
+
 __all__ = [
     "logger",
     "load_openai_module",
@@ -366,5 +549,10 @@ __all__ = [
     "build_multimodal_messages",
     "build_response_format",
     "build_chat_completion_create_params",
+    "model_requires_max_completion_tokens",
+    "apply_max_tokens_param",
+    "strip_unsupported_sampling_params",
     "extract_text_delta_from_event",
+    "extract_refusal_delta_from_event",
+    "extract_usage_bearing_event",
 ]

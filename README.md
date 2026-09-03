@@ -1109,6 +1109,7 @@ Notes:
 - **Adds latency**: primary and shadow providers run concurrently (`ThreadPoolExecutor` for `invoke()`, `asyncio.gather` for `ainvoke()`), so total call time is roughly `max(primary_latency, slowest_shadow_latency)` — not the sum, but not zero overhead either. `invoke()` waits for every shadow provider to finish (or fail) before returning.
 - **Costs real money**: each shadow provider gets one live API call per invocation. This cost is tracked in each shadow result's `total_cost` but is **not** added to `session_cost_used` / counted against `max_session_cost`.
 - Each shadow provider gets a single attempt — no retries. A shadow failure never raises and never affects the primary's result; it just shows up with `error` set in `last_shadow_results`.
+- Shadow requests are sent concurrently with the primary's, not after it succeeds — so if the primary call itself ultimately fails (retries exhausted, all providers failed, etc.), any shadow request already in flight still completes and is still recorded in `last_shadow_results`/the ledger (with `similarity=None`, since there's no primary text to compare against). The primary's own exception still propagates normally to the caller either way.
 - Only `invoke()`/`ainvoke()` dispatch shadows in this version — `stream()`/`astream()`/`invoke_with_tools()`/`invoke_structured()` don't.
 - If [Call Ledger](#call-ledger-audit-trail) is enabled, every shadow result is also recorded in a separate `shadow_calls` table.
 

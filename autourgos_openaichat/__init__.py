@@ -32,11 +32,13 @@ from .chat import (
     OpenAIChatModelError,
     OpenAIChatModelImportError,
     OpenAIChatModelRedactionBlockedError,
+    OpenAIChatModelRefusalError,
     OpenAIChatModelResponseError,
     OpenAIChatModelValidationError,
 )
 from .llm import (
     BaseLLM,
+    BaseProviderLLM,
     BudgetExceededException,
     CircuitBreakerOpenException,
     FunctionCall,
@@ -70,9 +72,11 @@ __all__ = [
     "OpenAIChatModelAllProvidersFailedError",
     "OpenAIChatModelValidationError",
     "OpenAIChatModelRedactionBlockedError",
+    "OpenAIChatModelRefusalError",
     "OpenAIChatModelDeadlineExceededError",
     # Base types
     "BaseLLM",
+    "BaseProviderLLM",
     "FunctionCall",
     "ToolCallResponse",
     "CircuitBreakerOpenException",

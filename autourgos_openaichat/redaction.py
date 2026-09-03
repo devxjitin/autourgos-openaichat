@@ -112,7 +112,17 @@ def compile_patterns(
     if custom_patterns:
         merged.update(custom_patterns)
 
-    return {name: re.compile(pattern) for name, pattern in merged.items()}
+    compiled: Dict[str, "re.Pattern"] = {}
+    for name, pattern in merged.items():
+        try:
+            compiled[name] = re.compile(pattern)
+        except re.error as exc:
+            # re.error is not a ValueError subclass, so it would otherwise
+            # bypass callers' `except ValueError` guards (both constructors
+            # wrap this call to re-raise as their own ConfigError) and leak
+            # out as a raw, unwrapped re.error instead.
+            raise ValueError(f"Invalid regex for redact pattern {name!r}: {pattern!r} ({exc})") from exc
+    return compiled
 
 
 class _RedactionState:
