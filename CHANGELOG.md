@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.6.2] - 2026-09-04
+
+- Internal: `_attempt_sync_create()`/`_attempt_async_create()`'s retry loop now delegates to `autourgos_core.retry_with_backoff()`/`aretry_with_backoff()` (bumped `autourgos-core>=0.6.0`). No functional change -- non-retryable-status-code short-circuit, `max_call_duration` deadline check, backoff formula (uncapped, unlike autourgos-agent's capped version -- preserved as-is), and both distinct final-failure error messages all hand-verified unchanged; existing test suite (`test_api_error_after_retries_exhausted`, `test_retries_then_succeeds`, `test_max_call_duration_*`) passes without modification. The streaming retry loop (`_invoke_stream_mode`/`_ainvoke_stream_mode`) is a different, generator-based pattern with multi-provider fallback and mid-stream state -- out of scope, not touched. Live-verified against real Azure (sync + async).
+
 ## [2.6.1] - 2026-09-04
 
 - Internal: `__version__` resolution moved to `autourgos_core.package_version()` (new `autourgos-core>=0.3.0` dependency; also fixes the hardcoded fallback string, stale at `"2.5.0"` since 2.6.0). "No autourgos-core dependency" in `chat.py`/`llm.py`/`model_runtime.py`'s docstrings and the README referred to the old, since-removed v3 "typed vocabulary" `autourgos-core` package -- the new `autourgos-core` is a separate, zero-dependency stdlib utility library; wording updated to clarify "no other third-party or autourgos-* dependency". No functional change.

@@ -20,6 +20,8 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional
 
 from concurrent.futures import ThreadPoolExecutor
 
+from autourgos_core import aretry_with_backoff, retry_with_backoff
+
 from .core import normalize_model_name
 from .ledger import open_ledger, write_ledger_entry, write_shadow_ledger_entry
 from .model_runtime import build_structured_output, track_latency
@@ -753,49 +755,64 @@ class BaseProviderLLM(BaseLLM):
     def _attempt_sync_create(
         self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
     ) -> Any:
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
+        def _do_attempt() -> Any:
             self._raise_if_deadline_exceeded(deadline, label)
-            try:
-                return self._do_sync_create(client, params)
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise self._api_error_cls(
-                        f"[{label}] {self._api_name} request failed with non-retryable status "
-                        f"{status_code}. Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if attempt == self.max_retries:
-                    raise self._api_error_cls(
-                        f"[{label}] {self._api_name} request failed after {self.max_retries} "
-                        f"attempts. Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                time.sleep(self.backoff_factor * (2 ** (attempt - 1)))
-        raise self._api_error_cls(f"[{label}] Unexpected retry exhaustion") from last_exc
+            return self._do_sync_create(client, params)
+
+        def _should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, self._deadline_exceeded_cls):
+                return False
+            return getattr(exc, "status_code", None) not in _NON_RETRYABLE_STATUS_CODES
+
+        try:
+            return retry_with_backoff(
+                _do_attempt, max_attempts=self.max_retries, backoff_base=self.backoff_factor,
+                should_retry=_should_retry,
+            )
+        except Exception as exc:
+            if isinstance(exc, self._deadline_exceeded_cls):
+                raise
+            status_code = getattr(exc, "status_code", None)
+            if status_code in _NON_RETRYABLE_STATUS_CODES:
+                raise self._api_error_cls(
+                    f"[{label}] {self._api_name} request failed with non-retryable status "
+                    f"{status_code}. Error: {type(exc).__name__}: {exc}"
+                ) from exc
+            raise self._api_error_cls(
+                f"[{label}] {self._api_name} request failed after {self.max_retries} "
+                f"attempts. Last error: {type(exc).__name__}: {exc}"
+            ) from exc
 
     async def _attempt_async_create(
         self, client: Any, params: Dict[str, Any], label: str, deadline: Optional[float] = None
     ) -> Any:
-        last_exc: Optional[Exception] = None
-        for attempt in range(1, self.max_retries + 1):
+        async def _do_attempt() -> Any:
             self._raise_if_deadline_exceeded(deadline, label)
-            try:
-                return await self._do_async_create(client, params)
-            except Exception as exc:
-                last_exc = exc
-                status_code = getattr(exc, "status_code", None)
-                if status_code in _NON_RETRYABLE_STATUS_CODES:
-                    raise self._api_error_cls(
-                        f"[{label}] Async {self._api_name} request failed with non-retryable "
-                        f"status {status_code}. Error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                if attempt == self.max_retries:
-                    raise self._api_error_cls(
-                        f"[{label}] Async {self._api_name} request failed after "
-                        f"{self.max_retries} attempts. Last error: {type(exc).__name__}: {exc}"
-                    ) from exc
-                await asyncio.sleep(self.backoff_factor * (2 ** (attempt - 1)))
+            return await self._do_async_create(client, params)
+
+        def _should_retry(exc: BaseException) -> bool:
+            if isinstance(exc, self._deadline_exceeded_cls):
+                return False
+            return getattr(exc, "status_code", None) not in _NON_RETRYABLE_STATUS_CODES
+
+        try:
+            return await aretry_with_backoff(
+                _do_attempt, max_attempts=self.max_retries, backoff_base=self.backoff_factor,
+                should_retry=_should_retry,
+            )
+        except Exception as exc:
+            if isinstance(exc, self._deadline_exceeded_cls):
+                raise
+            status_code = getattr(exc, "status_code", None)
+            if status_code in _NON_RETRYABLE_STATUS_CODES:
+                raise self._api_error_cls(
+                    f"[{label}] Async {self._api_name} request failed with non-retryable "
+                    f"status {status_code}. Error: {type(exc).__name__}: {exc}"
+                ) from exc
+            raise self._api_error_cls(
+                f"[{label}] Async {self._api_name} request failed after "
+                f"{self.max_retries} attempts. Last error: {type(exc).__name__}: {exc}"
+            ) from exc
         raise self._api_error_cls(f"[{label}] Unexpected async retry exhaustion") from last_exc
 
     def _create_raw(self, params: Dict[str, Any]) -> Any:

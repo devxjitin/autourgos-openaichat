@@ -56,7 +56,7 @@ from .model_runtime import (
 
 from autourgos_core import package_version
 
-__version__ = package_version("autourgos-openaichat", fallback="2.6.0")
+__version__ = package_version("autourgos-openaichat", fallback="2.6.2")
 
 __all__ = [
     # Main class
