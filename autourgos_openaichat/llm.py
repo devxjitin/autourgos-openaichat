@@ -1,7 +1,9 @@
 """
 BaseLLM — base interface for all autourgos-openaichat model wrappers.
 
-Fully self-contained: no autourgos-core dependency.
+Depends only on the `openai` SDK and `autourgos-core` (a separate,
+zero-dependency stdlib utility library shared across the framework) --
+no other third-party or autourgos-* dependency.
 """
 
 from __future__ import annotations

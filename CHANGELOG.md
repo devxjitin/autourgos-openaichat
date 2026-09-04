@@ -1,5 +1,9 @@
 # Changelog
 
+## [2.6.1] - 2026-09-04
+
+- Internal: `__version__` resolution moved to `autourgos_core.package_version()` (new `autourgos-core>=0.3.0` dependency; also fixes the hardcoded fallback string, stale at `"2.5.0"` since 2.6.0). "No autourgos-core dependency" in `chat.py`/`llm.py`/`model_runtime.py`'s docstrings and the README referred to the old, since-removed v3 "typed vocabulary" `autourgos-core` package -- the new `autourgos-core` is a separate, zero-dependency stdlib utility library; wording updated to clarify "no other third-party or autourgos-* dependency". No functional change.
+
 ## [2.6.0] - 2026-09-04
 
 - **Fixed (Critical, security/cost):** `invoke_with_tools()`/`ainvoke_with_tools()`

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "autourgos-openaichat"
-version = "2.6.0"
+version = "2.6.1"
 description = "Autourgos LLM wrapper for the OpenAI Chat Completions API"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,6 +35,7 @@ classifiers = [
 ]
 dependencies = [
     "openai>=1.0.0",
+    "autourgos-core>=0.3.0",
 ]
 
 [project.optional-dependencies]

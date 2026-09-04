@@ -54,11 +54,9 @@ from .model_runtime import (
     track_latency,
 )
 
-try:
-    from importlib.metadata import version as _v
-    __version__ = _v("autourgos-openaichat")
-except Exception:
-    __version__ = "2.5.0"
+from autourgos_core import package_version
+
+__version__ = package_version("autourgos-openaichat", fallback="2.6.0")
 
 __all__ = [
     # Main class
