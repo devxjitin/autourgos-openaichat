@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+_default_logger = logger
 
 # ── Module loading ────────────────────────────────────────────────────────────
 
@@ -406,7 +407,9 @@ def apply_max_tokens_param(params: Dict[str, Any], model_name: str) -> None:
         params["max_completion_tokens"] = params.pop("max_tokens")
 
 
-def strip_unsupported_sampling_params(params: Dict[str, Any], model_name: str) -> None:
+def strip_unsupported_sampling_params(
+    params: Dict[str, Any], model_name: str, *, logger: Optional[logging.Logger] = None,
+) -> None:
     """
     Drop ``temperature``/``top_p`` from ``params`` in place if ``model_name``
     is an o-series reasoning model -- those models reject both params
@@ -418,13 +421,18 @@ def strip_unsupported_sampling_params(params: Dict[str, Any], model_name: str) -
     Dropped rather than raised, so a caller with temperature/top_p set for a
     non-reasoning primary (with an o-series fallback configured, say) doesn't
     get a hard failure -- just a warning and the call proceeds without them.
+
+    ``logger`` defaults to this module's own logger; pass a caller-owned
+    logger (e.g. autourgos-responses' own module logger) so warnings are
+    attributed to the calling package instead of this one.
     """
+    log = logger if logger is not None else _default_logger
     if not model_requires_max_completion_tokens(model_name):
         return
     for key in ("temperature", "top_p"):
         if key in params:
             del params[key]
-            logger.warning(
+            log.warning(
                 "%s doesn't support %r -- dropped from the request instead of "
                 "sending it and getting a 400 (o-series reasoning models reject "
                 "temperature/top_p entirely).",

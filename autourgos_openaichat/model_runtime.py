@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from string import Formatter
-from typing import Any, Dict, Iterator, Optional
+from typing import Any, Callable, Dict, Iterator, Optional
 import time
 
 logger = logging.getLogger(__name__)
@@ -71,9 +71,15 @@ def build_structured_output(
     input_pricing: Optional[float] = None,
     output_pricing: Optional[float] = None,
     extra_fields: Optional[Dict[str, Any]] = None,
+    usage_fn: Callable[[Any], Dict[str, Optional[int]]] = extract_usage_metadata,
 ) -> Dict[str, Any]:
-    """Return a normalized dict with usage metadata and optional cost fields."""
-    usage = extract_usage_metadata(raw_response)
+    """Return a normalized dict with usage metadata and optional cost fields.
+
+    ``usage_fn`` defaults to this module's own ``extract_usage_metadata``;
+    pass a different extractor (e.g. autourgos-responses' Responses-API-
+    shaped one) to reuse this function's payload-building logic unchanged.
+    """
+    usage = usage_fn(raw_response)
 
     payload: Dict[str, Any] = {
         "model": model_name,

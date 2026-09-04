@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.6.5] - 2026-09-05
+
+- Internal: extracted `_OpenAIClientLifecycleMixin` (`_init_clients`/lazy fallback+shadow client getters/`close`/`aclose`/context-manager dunders) into `llm.py`, shared by `OpenAIChatModel` and `OpenAIResponse` (autourgos-responses) instead of being duplicated byte-for-byte in each package's main class. `OpenAIChatModel` now mixes it in; the previously-inline methods are removed. Subclasses set `_import_error_cls` and override `_get_openai_client_classes()` (a classmethod re-reading the module's own `load_openai_module()` globals fresh on every call, so tests patching those globals still work). No behavior change -- live-verified sync/async `invoke`, `with`/`async with`, and explicit `close()` against real Azure; added regression tests for `close()`/`aclose()` called directly (previously only exercised via context managers).
+
+## [2.6.4] - 2026-09-05
+
+- Added: `build_structured_output(..., usage_fn=extract_usage_metadata)` gains an optional `usage_fn` keyword (defaults to this module's own `extract_usage_metadata`, unchanged behavior for existing callers) so autourgos-responses can reuse this function's payload-building logic while binding its own Responses-API-shaped usage extractor. No behavior change for existing callers.
+
+## [2.6.3] - 2026-09-05
+
+- Added: `strip_unsupported_sampling_params(params, model_name, *, logger=None)` gains an optional `logger` keyword (defaults to this module's own logger, unchanged behavior for existing callers) so autourgos-responses can reuse this function while logging warnings through its own package logger. No behavior change for existing callers.
+
 ## [2.6.2] - 2026-09-04
 
 - Internal: `_attempt_sync_create()`/`_attempt_async_create()`'s retry loop now delegates to `autourgos_core.retry_with_backoff()`/`aretry_with_backoff()` (bumped `autourgos-core>=0.6.0`). No functional change -- non-retryable-status-code short-circuit, `max_call_duration` deadline check, backoff formula (uncapped, unlike autourgos-agent's capped version -- preserved as-is), and both distinct final-failure error messages all hand-verified unchanged; existing test suite (`test_api_error_after_retries_exhausted`, `test_retries_then_succeeds`, `test_max_call_duration_*`) passes without modification. The streaming retry loop (`_invoke_stream_mode`/`_ainvoke_stream_mode`) is a different, generator-based pattern with multi-provider fallback and mid-stream state -- out of scope, not touched. Live-verified against real Azure (sync + async).

@@ -900,6 +900,24 @@ def test_async_context_manager_closes_both_clients():
     assert llm._async_client is None
 
 
+def test_close_method_releases_sync_client_without_with_statement():
+    llm = make_llm()
+    close_mock = llm._client.close
+    llm.close()
+    close_mock.assert_called_once()
+    assert llm._client is None
+
+
+def test_aclose_method_releases_both_clients_without_async_with():
+    llm = make_llm()
+    llm._async_client.aclose = AsyncMock()
+    aclose_mock = llm._async_client.aclose
+    asyncio.run(llm.aclose())
+    aclose_mock.assert_called_once()
+    assert llm._client is None
+    assert llm._async_client is None
+
+
 # ── 15. Circuit breaker ──────────────────────────────────────────────────────
 
 def test_circuit_breaker_opens_after_threshold_and_blocks():
