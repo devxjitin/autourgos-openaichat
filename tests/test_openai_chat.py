@@ -2057,6 +2057,105 @@ def test_redact_mode_block_raises_before_api_call_for_invoke_with_tools():
     llm._client.chat.completions.create.assert_not_called()
 
 
+# ── Sprint 0 regression: invoke_with_tools()/ainvoke_with_tools() used to
+# bypass budget/ledger/redaction-restore entirely (native tool-calling mode
+# called _create_across_providers() directly, skipping the same machinery
+# invoke() goes through). ────────────────────────────────────────────────────
+
+def test_budget_governor_blocks_invoke_with_tools_once_cap_reached():
+    llm = make_llm(input_pricing=1000, output_pricing=1000, max_session_cost=0.01)
+    llm._client.chat.completions.create.return_value = make_completion("ok")  # usage (9,10,19) -> $0.019
+    llm.invoke_with_tools("hi", TOOLS)  # 1st call goes through, pushes usage over the cap
+    assert llm.session_cost_used >= 0.01
+
+    with pytest.raises(BudgetExceededException):
+        llm.invoke_with_tools("hi again", TOOLS)
+    assert llm._client.chat.completions.create.call_count == 1  # 2nd call never reached the API
+
+
+def test_budget_governor_blocks_ainvoke_with_tools_once_cap_reached():
+    llm = make_llm(input_pricing=1000, output_pricing=1000, max_session_cost=0.01)
+    llm._async_client.chat.completions.create = AsyncMock(return_value=make_completion("ok"))
+
+    async def run():
+        await llm.ainvoke_with_tools("hi", TOOLS)
+        with pytest.raises(BudgetExceededException):
+            await llm.ainvoke_with_tools("hi again", TOOLS)
+
+    asyncio.run(run())
+    assert llm._async_client.chat.completions.create.call_count == 1
+
+
+def test_ledger_records_invoke_with_tools(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke_with_tools("Capital of France?", TOOLS)
+
+    rows = _read_ledger_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["call_type"] == "invoke_with_tools"
+    assert rows[0]["response"] == "Paris"
+
+
+def test_ledger_records_ainvoke_with_tools(tmp_path):
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    llm._async_client.chat.completions.create = AsyncMock(return_value=make_completion("Berlin"))
+
+    async def run():
+        return await llm.ainvoke_with_tools("Capital of Germany?", TOOLS)
+
+    asyncio.run(run())
+    rows = _read_ledger_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["call_type"] == "ainvoke_with_tools"
+    assert rows[0]["response"] == "Berlin"
+
+
+def test_ledger_does_not_record_tool_calls_response_text(tmp_path):
+    """When the model calls a tool (no final-answer text), the ledger's
+    response column should reflect that (None), not crash on it."""
+    db_path = tmp_path / "calls.db"
+    llm = make_llm(ledger_path=str(db_path))
+    raw = make_completion(text=None, tool_calls=[make_tool_call("get_weather", {"city": "Tokyo"})])
+    llm._client.chat.completions.create.return_value = raw
+    llm.invoke_with_tools("Weather in Tokyo?", TOOLS)
+
+    rows = _read_ledger_rows(db_path)
+    assert len(rows) == 1
+    assert rows[0]["call_type"] == "invoke_with_tools"
+    assert rows[0]["response"] is None
+
+
+def test_redact_restore_in_response_applies_to_invoke_with_tools():
+    """
+    Regression: invoke_with_tools() discarded its redaction_map entirely, so
+    redact_restore_in_response=True (working correctly in invoke()) silently
+    had no effect in native tool-calling mode -- the caller got back the
+    masked placeholder instead of the original text.
+    """
+    llm = make_llm(redact_pii=True, redact_mode="mask", redact_restore_in_response=True)
+    llm._client.chat.completions.create.return_value = make_completion(
+        "Sure, I'll email bob@example.com"
+    )
+    resp = llm.invoke_with_tools("contact bob@example.com please", TOOLS)
+    assert resp.text == "Sure, I'll email bob@example.com"
+
+
+def test_redact_restore_in_response_applies_to_ainvoke_with_tools():
+    llm = make_llm(redact_pii=True, redact_mode="mask", redact_restore_in_response=True)
+    llm._async_client.chat.completions.create = AsyncMock(
+        return_value=make_completion("Sure, I'll email bob@example.com")
+    )
+
+    async def run():
+        return await llm.ainvoke_with_tools("contact bob@example.com please", TOOLS)
+
+    resp = asyncio.run(run())
+    assert resp.text == "Sure, I'll email bob@example.com"
+
+
 def test_redaction_block_mode_raises_before_api_call():
     llm = make_llm(redact_pii=True, redact_mode="block")
     with pytest.raises(OpenAIChatModelRedactionBlockedError) as exc_info:

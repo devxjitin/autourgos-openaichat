@@ -1043,7 +1043,7 @@ class OpenAIChatModel(BaseProviderLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, None, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, None, files)
         self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
@@ -1051,11 +1051,30 @@ class OpenAIChatModel(BaseProviderLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = tool_choice
-        raw, _provider_label, _provider_model, _provider_pricing = self._create_across_providers(params)
-        tool_calls = self._parse_tool_calls(raw) if openai_tools else []
+        with self._budget_admission():
+            with track_latency() as timing:
+                raw, provider_label, provider_model, provider_pricing = self._create_across_providers(params)
+            tool_calls = self._parse_tool_calls(raw) if openai_tools else []
+            masked_text = extract_text_from_response(raw) if not tool_calls else None
+            text = restore_text(masked_text, redaction_map) if (
+                masked_text and self.redact_restore_in_response
+            ) else masked_text
+            metadata = build_structured_output(
+                model_name=provider_model,
+                response_text=masked_text,
+                raw_response=raw,
+                latency_ms=timing["latency_ms"],
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
+                extra_fields={"provider_used": provider_label},
+            )
+            self._record_session_cost(metadata.get("total_cost"))
+            self._log_to_ledger(
+                call_type="invoke_with_tools", prompt=resolved, metadata=metadata,
+                redacted_categories=redacted_categories, response_override=masked_text,
+            )
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)
-        text = extract_text_from_response(raw)
         return ToolCallResponse(text=text, raw=raw)
 
     async def ainvoke_with_tools(
@@ -1068,7 +1087,7 @@ class OpenAIChatModel(BaseProviderLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
-        resolved, redacted_categories, _redaction_map = self._resolve_prompt(prompt, None, files)
+        resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, None, files)
         self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
         openai_tools = self._tools_to_openai_format(tools)
@@ -1076,11 +1095,30 @@ class OpenAIChatModel(BaseProviderLLM):
         if openai_tools:
             params["tools"] = openai_tools
             params["tool_choice"] = tool_choice
-        raw, _provider_label, _provider_model, _provider_pricing = await self._acreate_across_providers(params)
-        tool_calls = self._parse_tool_calls(raw) if openai_tools else []
+        async with self._async_budget_admission():
+            with track_latency() as timing:
+                raw, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(params)
+            tool_calls = self._parse_tool_calls(raw) if openai_tools else []
+            masked_text = extract_text_from_response(raw) if not tool_calls else None
+            text = restore_text(masked_text, redaction_map) if (
+                masked_text and self.redact_restore_in_response
+            ) else masked_text
+            metadata = build_structured_output(
+                model_name=provider_model,
+                response_text=masked_text,
+                raw_response=raw,
+                latency_ms=timing["latency_ms"],
+                input_pricing=provider_pricing[0],
+                output_pricing=provider_pricing[1],
+                extra_fields={"provider_used": provider_label},
+            )
+            self._record_session_cost(metadata.get("total_cost"))
+            self._log_to_ledger(
+                call_type="ainvoke_with_tools", prompt=resolved, metadata=metadata,
+                redacted_categories=redacted_categories, response_override=masked_text,
+            )
         if tool_calls:
             return ToolCallResponse(tool_calls=tool_calls, raw=raw)
-        text = extract_text_from_response(raw)
         return ToolCallResponse(text=text, raw=raw)
 
     # ── Repr ──────────────────────────────────────────────────────────────────

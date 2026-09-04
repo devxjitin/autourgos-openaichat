@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.6.0] - 2026-09-04
+
+- **Fixed (Critical, security/cost):** `invoke_with_tools()`/`ainvoke_with_tools()`
+  called `_create_across_providers()`/`_acreate_across_providers()` directly,
+  bypassing `max_session_cost` budget enforcement, the SQLite call ledger, and
+  `redact_restore_in_response` entirely. A caller relying on native tool-calling
+  mode got no budget cap, no ledger audit trail, and no redaction restore —
+  all working correctly in `invoke()`/`ainvoke()` but silently absent here.
+  Both methods now go through `_budget_admission()`/`_async_budget_admission()`,
+  record session cost, log a `call_type="invoke_with_tools"`/
+  `"ainvoke_with_tools"` ledger entry, and restore redacted placeholders in
+  the final-answer text (not applicable when the model returns tool calls
+  instead of text).
+
 ## [2.5.0] - 2026-09-02
 
 - Fixed: `invoke_with_tools()`/`ainvoke_with_tools()` built messages directly from
