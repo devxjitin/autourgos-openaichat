@@ -1745,6 +1745,74 @@ def test_max_call_duration_applies_to_ainvoke():
         asyncio.run(run())
 
 
+# ── 18c. Agent-supplied deadline (_agent_deadline_seconds) ───────────────────
+# FRAMEWORK_REVIEW.md Finding #1, Sprint 1b: an owning Agent's remaining
+# max_execution_time is threaded through as a reserved `_agent_deadline_seconds`
+# kwarg so the retry/fallback loop stops once EITHER max_call_duration or the
+# agent's own budget runs out -- whichever is tighter.
+
+def test_new_deadline_takes_earlier_of_max_call_duration_and_agent_deadline():
+    llm = make_llm(max_call_duration=10.0)
+    tight = llm._new_deadline(agent_deadline_seconds=0.01)
+    loose = llm._new_deadline(agent_deadline_seconds=100.0)
+    assert tight < loose
+
+
+def test_new_deadline_none_when_neither_set():
+    llm = make_llm()
+    assert llm._new_deadline() is None
+    assert llm._new_deadline(agent_deadline_seconds=None) is None
+
+
+def test_agent_deadline_stops_fallback_like_max_call_duration():
+    """Mirrors test_max_call_duration_stops_before_trying_fallback, but driven
+    purely by an inherited agent deadline with no max_call_duration set at all."""
+    llm = make_llm_with_fallback(max_retries=3, backoff_factor=1.0)
+    assert llm.max_call_duration is None
+    llm._client.chat.completions.create.side_effect = RuntimeError("primary flaky")
+
+    with pytest.raises(OpenAIChatModelDeadlineExceededError):
+        llm.invoke("hi", _agent_deadline_seconds=0.05)
+
+    assert llm._client.chat.completions.create.call_count >= 1
+    llm._fallback_sync_clients[0].chat.completions.create.assert_not_called()
+
+
+def test_agent_deadline_seconds_never_reaches_request_params():
+    """The reserved kwarg must be popped before it can leak into the OpenAI
+    request params -- an unrecognized param would break the real API call."""
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("Paris")
+    llm.invoke("hi", _agent_deadline_seconds=5.0)
+    _, call_kwargs = llm._client.chat.completions.create.call_args
+    assert "_agent_deadline_seconds" not in call_kwargs
+
+
+def test_invoke_with_tools_pops_agent_deadline_and_never_leaks_it():
+    llm = make_llm()
+    llm._client.chat.completions.create.return_value = make_completion("no tools needed")
+    llm.invoke_with_tools("hi", tools=[], _agent_deadline_seconds=5.0)
+    _, call_kwargs = llm._client.chat.completions.create.call_args
+    assert "_agent_deadline_seconds" not in call_kwargs
+
+
+def test_ainvoke_with_tools_pops_agent_deadline_and_never_leaks_it():
+    llm = make_llm()
+    llm._async_client.chat.completions.create = AsyncMock(return_value=make_completion("no tools needed"))
+
+    async def run():
+        return await llm.ainvoke_with_tools("hi", tools=[], _agent_deadline_seconds=5.0)
+
+    asyncio.run(run())
+    _, call_kwargs = llm._async_client.chat.completions.create.call_args
+    assert "_agent_deadline_seconds" not in call_kwargs
+
+
+def test_supports_agent_deadline_flag_set_on_openaichatmodel():
+    llm = make_llm()
+    assert llm.SUPPORTS_AGENT_DEADLINE is True
+
+
 # ── 19. Validated structured output (invoke_structured) ─────────────────────
 
 from autourgos_openaichat import OpenAIChatModelValidationError

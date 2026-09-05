@@ -203,6 +203,15 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
 
     _import_error_cls = OpenAIChatModelImportError
 
+    # Opt-in marker an owning Agent checks (via getattr, defaulting to False)
+    # before injecting the reserved `_agent_deadline_seconds` kwarg into a
+    # call -- see invoke()/ainvoke()/invoke_with_tools()/ainvoke_with_tools()
+    # below, which pop it before it can leak into the OpenAI request params.
+    # Deliberately set only here, not on the shared BaseProviderLLM base --
+    # autourgos-responses' OpenAIResponse also extends BaseProviderLLM but
+    # does not pop this kwarg, so it must not receive it.
+    SUPPORTS_AGENT_DEADLINE = True
+
     @classmethod
     def _get_openai_client_classes(cls):
         return openai_cls, async_openai_cls, _OPENAI_AVAILABLE, _OPENAI_IMPORT_ERROR
@@ -249,11 +258,21 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
     def _extract_refusal_delta(self, event: Any) -> Optional[str]:
         return extract_refusal_delta_from_event(event)
 
-    def _invoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
-        return self._invoke_non_stream(messages=prepared_input, overrides=overrides)
+    def _invoke_non_stream_for_call(
+        self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]],
+        agent_deadline_seconds: Optional[float] = None,
+    ) -> Any:
+        return self._invoke_non_stream(
+            messages=prepared_input, overrides=overrides, agent_deadline_seconds=agent_deadline_seconds
+        )
 
-    async def _ainvoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
-        return await self._ainvoke_non_stream(messages=prepared_input, overrides=overrides)
+    async def _ainvoke_non_stream_for_call(
+        self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]],
+        agent_deadline_seconds: Optional[float] = None,
+    ) -> Any:
+        return await self._ainvoke_non_stream(
+            messages=prepared_input, overrides=overrides, agent_deadline_seconds=agent_deadline_seconds
+        )
 
     _validation_error_cls = OpenAIChatModelValidationError
     _create_input_key = "messages"
@@ -616,10 +635,13 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
     # ── Non-stream invocation ─────────────────────────────────────────────────
 
     def _invoke_non_stream(
-        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> Any:
         params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
-        resp, provider_label, provider_model, provider_pricing = self._create_across_providers(params)
+        resp, provider_label, provider_model, provider_pricing = self._create_across_providers(
+            params, agent_deadline_seconds=agent_deadline_seconds
+        )
         text = extract_text_from_response(resp)
         if text:
             return text, resp, provider_label, provider_model, provider_pricing
@@ -634,10 +656,13 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
         )
 
     async def _ainvoke_non_stream(
-        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None
+        self, *, messages: List[Dict[str, Any]], overrides: Optional[Dict[str, Any]] = None,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> Any:
         params = self._build_base_params(messages=messages, stream=False, overrides=overrides)
-        resp, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(params)
+        resp, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(
+            params, agent_deadline_seconds=agent_deadline_seconds
+        )
         text = extract_text_from_response(resp)
         if text:
             return text, resp, provider_label, provider_model, provider_pricing
@@ -680,6 +705,11 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
         Returns:
             Generated text string, or a metadata dict if structured_output=True.
         """
+        # Popped before anything else touches overrides -- see
+        # SUPPORTS_AGENT_DEADLINE's comment: this reserved kwarg (set only by
+        # an owning Agent, never by a caller directly) must never reach the
+        # OpenAI request params.
+        agent_deadline_seconds = overrides.pop("_agent_deadline_seconds", None)
         self._check_budget()
         resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
         self.last_redacted_categories = redacted_categories
@@ -690,6 +720,7 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
             redacted_categories=redacted_categories,
             redaction_map=redaction_map,
             overrides=overrides,
+            agent_deadline_seconds=agent_deadline_seconds,
         )
 
     async def ainvoke(
@@ -702,6 +733,7 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
         **overrides: Any,
     ) -> Any:
         """Async version of invoke(). See invoke() for **overrides semantics."""
+        agent_deadline_seconds = overrides.pop("_agent_deadline_seconds", None)
         self._check_budget()
         resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, prompt_variables, files)
         self.last_redacted_categories = redacted_categories
@@ -710,6 +742,7 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
             prepared_input=messages,
             resolved=resolved,
             redacted_categories=redacted_categories,
+            agent_deadline_seconds=agent_deadline_seconds,
             redaction_map=redaction_map,
             overrides=overrides,
         )
@@ -904,6 +937,9 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
+        # See invoke()'s identical comment: must be popped before `kwargs`
+        # is treated as request-param overrides below.
+        agent_deadline_seconds = kwargs.pop("_agent_deadline_seconds", None)
         resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, None, files)
         self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
@@ -914,7 +950,9 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
             params["tool_choice"] = tool_choice
         with self._budget_admission():
             with track_latency() as timing:
-                raw, provider_label, provider_model, provider_pricing = self._create_across_providers(params)
+                raw, provider_label, provider_model, provider_pricing = self._create_across_providers(
+                    params, agent_deadline_seconds=agent_deadline_seconds
+                )
             tool_calls = self._parse_tool_calls(raw) if openai_tools else []
             masked_text = extract_text_from_response(raw) if not tool_calls else None
             text = restore_text(masked_text, redaction_map) if (
@@ -948,6 +986,7 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
         image_detail = kwargs.pop("image_detail", None)
         files = kwargs.pop("files", None)
         tool_choice = kwargs.pop("tool_choice", "auto")
+        agent_deadline_seconds = kwargs.pop("_agent_deadline_seconds", None)
         resolved, redacted_categories, redaction_map = self._resolve_prompt(prompt, None, files)
         self.last_redacted_categories = redacted_categories
         messages = self._build_messages(resolved, files=files, image_detail=image_detail)
@@ -958,7 +997,9 @@ class OpenAIChatModel(_OpenAIClientLifecycleMixin, BaseProviderLLM):
             params["tool_choice"] = tool_choice
         async with self._async_budget_admission():
             with track_latency() as timing:
-                raw, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(params)
+                raw, provider_label, provider_model, provider_pricing = await self._acreate_across_providers(
+                    params, agent_deadline_seconds=agent_deadline_seconds
+                )
             tool_calls = self._parse_tool_calls(raw) if openai_tools else []
             masked_text = extract_text_from_response(raw) if not tool_calls else None
             text = restore_text(masked_text, redaction_map) if (

@@ -945,6 +945,8 @@ except OpenAIChatModelDeadlineExceededError as e:
 
 The deadline is checked *between* attempts/providers, not by cancelling a request already sent — an in-flight HTTP call stays bounded by `timeout` as usual, so total wall-clock time can exceed `max_call_duration` by up to one in-flight request's duration, but never by a further full retry or fallback cycle. `None` (the default) disables this entirely — retries and fallback behave exactly as before. `create()`/`acreate()` respect it too, applied to that single primary-only call.
 
+**Combined with an owning Agent's deadline:** when an `OpenAIChatModel` is used via `autourgos-agent`'s `Agent` with `max_execution_time` set, the agent's own remaining run time is automatically combined with `max_call_duration` — whichever is tighter wins, so retries/fallback providers stop as soon as the agent is about to time out anyway, instead of continuing to burn time and cost on attempts that can't matter. This is opt-in per LLM class via `SUPPORTS_AGENT_DEADLINE = True` (set on `OpenAIChatModel`); nothing needs to be configured by hand, and any other `BaseLLM` implementation without this attribute is unaffected.
+
 ### Cost Tracking
 
 Pass pricing (USD per 1 million tokens) to get cost breakdowns.

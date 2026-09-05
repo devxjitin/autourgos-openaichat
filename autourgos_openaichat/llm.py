@@ -833,11 +833,24 @@ class BaseProviderLLM(BaseLLM):
                 (cfg.get("input_pricing"), cfg.get("output_pricing")),
             )
 
-    def _new_deadline(self) -> Optional[float]:
-        """Return an absolute perf_counter() deadline, or None if uncapped."""
-        if self.max_call_duration is None:
-            return None
-        return time.perf_counter() + self.max_call_duration
+    def _new_deadline(self, agent_deadline_seconds: Optional[float] = None) -> Optional[float]:
+        """Return an absolute perf_counter() deadline, or None if uncapped.
+
+        ``agent_deadline_seconds``, when given, is a caller-supplied "time
+        remaining" (e.g. an owning Agent's max_execution_time budget) that's
+        combined with this instance's own ``max_call_duration`` via min() --
+        whichever runs out first wins. A non-positive value means the caller
+        is already out of time, so the returned deadline is already-past
+        (``time.perf_counter()``) rather than in the future, tripping the
+        very next ``_raise_if_deadline_exceeded`` check immediately instead
+        of allowing one more attempt/provider to be tried.
+        """
+        candidates: List[float] = []
+        if self.max_call_duration is not None:
+            candidates.append(time.perf_counter() + self.max_call_duration)
+        if agent_deadline_seconds is not None:
+            candidates.append(time.perf_counter() + max(agent_deadline_seconds, 0.0))
+        return min(candidates) if candidates else None
 
     def _raise_if_deadline_exceeded(self, deadline: Optional[float], label: str) -> None:
         if deadline is not None and time.perf_counter() >= deadline:
@@ -1016,15 +1029,21 @@ class BaseProviderLLM(BaseLLM):
 
     # ── Raw API calls across primary + fallback providers ───────────────────────
 
-    def _create_across_providers(self, params: Dict[str, Any]) -> tuple:
+    def _create_across_providers(
+        self, params: Dict[str, Any], agent_deadline_seconds: Optional[float] = None
+    ) -> tuple:
         """
         Try the primary, then each fallback provider in order.
 
         Returns (raw, label, model_name, pricing) — ``model_name`` and
         ``pricing`` describe whichever target actually answered, not always
         the primary, so callers can attribute metadata/cost correctly.
+
+        ``agent_deadline_seconds``: see ``_new_deadline()`` -- an owning
+        Agent's remaining run time, combined with ``max_call_duration`` so
+        retries/fallback providers stop once either budget runs out.
         """
-        deadline = self._new_deadline()
+        deadline = self._new_deadline(agent_deadline_seconds)
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._sync_targets():
             self._raise_if_deadline_exceeded(deadline, label)
@@ -1048,9 +1067,11 @@ class BaseProviderLLM(BaseLLM):
             attempts=attempts,
         )
 
-    async def _acreate_across_providers(self, params: Dict[str, Any]) -> tuple:
+    async def _acreate_across_providers(
+        self, params: Dict[str, Any], agent_deadline_seconds: Optional[float] = None
+    ) -> tuple:
         """Async counterpart of ``_create_across_providers()``. See its docstring for the return shape."""
-        deadline = self._new_deadline()
+        deadline = self._new_deadline(agent_deadline_seconds)
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._async_targets():
             self._raise_if_deadline_exceeded(deadline, label)
@@ -1277,6 +1298,7 @@ class BaseProviderLLM(BaseLLM):
         prompt_input: Any,
         overrides: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[List[Dict[str, Any]]] = None,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> Iterator[str]:
         """
         ``usage_sink``, if provided, is a call-local list this appends
@@ -1288,7 +1310,7 @@ class BaseProviderLLM(BaseLLM):
         written to ``self``, so it can't cross-contaminate concurrent calls.
         """
         base_params = self._build_base_params_for_call(prompt_input, stream=True, overrides=overrides)
-        deadline = self._new_deadline()
+        deadline = self._new_deadline(agent_deadline_seconds)
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._sync_targets():
             self._raise_if_deadline_exceeded(deadline, label)
@@ -1376,10 +1398,11 @@ class BaseProviderLLM(BaseLLM):
         prompt_input: Any,
         overrides: Optional[Dict[str, Any]] = None,
         usage_sink: Optional[List[Dict[str, Any]]] = None,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> AsyncIterator[str]:
         """Async counterpart of ``_invoke_stream_mode()``. See its docstring for ``usage_sink``."""
         base_params = self._build_base_params_for_call(prompt_input, stream=True, overrides=overrides)
-        deadline = self._new_deadline()
+        deadline = self._new_deadline(agent_deadline_seconds)
         attempts: List[Any] = []
         for label, model_name, client, pricing in self._async_targets():
             self._raise_if_deadline_exceeded(deadline, label)
@@ -1507,12 +1530,18 @@ class BaseProviderLLM(BaseLLM):
         resolved = self._resolve_prompt_raw(prompt, prompt_variables, files)
         return self._apply_redaction(resolved)
 
-    def _invoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
+    def _invoke_non_stream_for_call(
+        self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]],
+        agent_deadline_seconds: Optional[float] = None,
+    ) -> Any:
         """Subclass one-liner forwarding to the local _invoke_non_stream(), whose keyword
         name for the prompt payload (``messages=`` vs ``input_data=``) differs per package."""
         raise NotImplementedError
 
-    async def _ainvoke_non_stream_for_call(self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]]) -> Any:
+    async def _ainvoke_non_stream_for_call(
+        self, prepared_input: Any, *, overrides: Optional[Dict[str, Any]],
+        agent_deadline_seconds: Optional[float] = None,
+    ) -> Any:
         """Async counterpart of ``_invoke_non_stream_for_call()``."""
         raise NotImplementedError
 
@@ -1532,6 +1561,7 @@ class BaseProviderLLM(BaseLLM):
         overrides: Dict[str, Any],
         call_type: str = "invoke",
         force_non_stream: bool = False,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> Any:
         """
         ``call_type`` names this call in the ledger (e.g. "invoke", "chat").
@@ -1561,7 +1591,8 @@ class BaseProviderLLM(BaseLLM):
                         # can't cross-contaminate each other's cost accounting.
                         usage_sink: List[Dict[str, Any]] = []
                         response_text = "".join(self._invoke_stream_mode(
-                            prompt_input=prepared_input, overrides=overrides, usage_sink=usage_sink
+                            prompt_input=prepared_input, overrides=overrides, usage_sink=usage_sink,
+                            agent_deadline_seconds=agent_deadline_seconds,
                         ))
                         if usage_sink:
                             entry = usage_sink[-1]
@@ -1579,8 +1610,16 @@ class BaseProviderLLM(BaseLLM):
                             provider_model = self._model_name
                             provider_pricing = (self.input_pricing, self.output_pricing)
                     else:
+                        # agent_deadline_seconds is only ever passed as a kwarg
+                        # when set -- a subclass's _invoke_non_stream_for_call()
+                        # override that predates this parameter (e.g.
+                        # autourgos-responses' OpenAIResponse) has no such
+                        # parameter in its signature at all, so passing it
+                        # explicitly even as None would raise TypeError for
+                        # every call, not just ones that use this feature.
+                        _extra = {"agent_deadline_seconds": agent_deadline_seconds} if agent_deadline_seconds is not None else {}
                         response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                            self._invoke_non_stream_for_call(prepared_input, overrides=overrides)
+                            self._invoke_non_stream_for_call(prepared_input, overrides=overrides, **_extra)
                         )
 
                 masked_response_text = response_text
@@ -1624,6 +1663,7 @@ class BaseProviderLLM(BaseLLM):
         overrides: Dict[str, Any],
         call_type: str = "ainvoke",
         force_non_stream: bool = False,
+        agent_deadline_seconds: Optional[float] = None,
     ) -> Any:
         """Async counterpart of ``_run_invoke()``. See its docstring/comments for rationale."""
         use_streaming = self.streaming and not force_non_stream
@@ -1639,7 +1679,8 @@ class BaseProviderLLM(BaseLLM):
                         usage_sink: List[Dict[str, Any]] = []
                         chunks: List[str] = []
                         async for delta in self._ainvoke_stream_mode(
-                            prompt_input=prepared_input, overrides=overrides, usage_sink=usage_sink
+                            prompt_input=prepared_input, overrides=overrides, usage_sink=usage_sink,
+                            agent_deadline_seconds=agent_deadline_seconds,
                         ):
                             chunks.append(delta)
                         response_text = "".join(chunks)
@@ -1655,8 +1696,10 @@ class BaseProviderLLM(BaseLLM):
                             provider_model = self._model_name
                             provider_pricing = (self.input_pricing, self.output_pricing)
                     else:
+                        # See _run_invoke's identical comment: only passed when set.
+                        _extra = {"agent_deadline_seconds": agent_deadline_seconds} if agent_deadline_seconds is not None else {}
                         response_text, raw_response, provider_label, provider_model, provider_pricing = (
-                            await self._ainvoke_non_stream_for_call(prepared_input, overrides=overrides)
+                            await self._ainvoke_non_stream_for_call(prepared_input, overrides=overrides, **_extra)
                         )
 
                 masked_response_text = response_text
